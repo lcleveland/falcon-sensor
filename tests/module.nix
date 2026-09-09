@@ -74,16 +74,39 @@ in
 pkgs.testers.runNixOSTest {
   name = "falcon-sensor-module";
 
-  # Second node: use the falcon-sensor.service that ships inside the .deb,
-  # with this module contributing only a drop-in for ordering.
+  # Second node: use the falcon-sensor.service that ships inside the .deb, with
+  # this module contributing only a drop-in for ordering. Also the coverage for
+  # the two credential options the first node does not exercise -- cidFile and
+  # maintenanceTokenFile -- so every *File option is run, not just evaluated.
   nodes.vendorunit = {
     imports = [ self.nixosModules.default ];
 
     services.falcon-sensor = {
       enable = true;
       package = fakePackage;
-      cid = "0123456789ABCDEF0123456789ABCDEF-01";
+      cidFile = "/run/falcon-test-secrets/cid";
+      maintenanceTokenFile = "/run/falcon-test-secrets/maintenance-token";
       useVendorUnit = true;
+    };
+
+    # Generated at runtime so the values exist nowhere in the Nix store, which
+    # is what makes the leak assertions meaningful rather than circular.
+    systemd.services.falcon-test-secret = {
+      description = "Provision test CID and maintenance token";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "falcon-sensor-configure.service" ];
+      path = [ pkgs.coreutils ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        install -d -m 0700 /run/falcon-test-secrets
+        hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n' | tr 'a-f' 'A-F'; }
+        printf '%s-01' "$(hex 16)" > /run/falcon-test-secrets/cid
+        hex 16 > /run/falcon-test-secrets/maintenance-token
+        chmod 0400 /run/falcon-test-secrets/*
+      '';
     };
   };
   nodes.machine = {
@@ -220,5 +243,26 @@ pkgs.testers.runNixOSTest {
         vendorunit.succeed(
             "test -d /etc/systemd/system/falcon-sensor.service.d"
         )
+
+    with subtest("cidFile and maintenanceTokenFile are delivered from files"):
+        vendorunit.wait_for_unit("falcon-sensor-configure.service")
+        cid = vendorunit.succeed("cat /run/falcon-test-secrets/cid").strip()
+        maint = vendorunit.succeed("cat /run/falcon-test-secrets/maintenance-token").strip()
+        ctl_log = vendorunit.succeed("cat /opt/CrowdStrike/falconctl.log")
+
+        assert f"--cid={cid}" in ctl_log, ctl_log
+        assert f"--maintenance-token={maint}" in ctl_log, ctl_log
+
+        # Tamper protection rejects every other change until the maintenance
+        # token is set, so it must be the first falconctl call.
+        lines = [x for x in ctl_log.splitlines() if x.strip()]
+        assert "--maintenance-token=" in lines[0], f"maintenance token not applied first: {lines}"
+
+    with subtest("neither the CID nor the maintenance token leaks"):
+        cid = vendorunit.succeed("cat /run/falcon-test-secrets/cid").strip()
+        maint = vendorunit.succeed("cat /run/falcon-test-secrets/maintenance-token").strip()
+        for secret in (cid, maint):
+            vendorunit.fail(f"grep -r --binary-files=text -q {secret} /etc/systemd/system/")
+            vendorunit.fail(f"journalctl -u falcon-sensor-configure.service | grep -q {secret}")
   '';
 }
