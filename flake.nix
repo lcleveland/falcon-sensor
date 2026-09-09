@@ -42,6 +42,15 @@
 
       nixosModules.default = import ./modules/falcon-sensor.nix;
 
+      # Makes `pkgs.falcon-sensor` resolve, which is what the module's `package`
+      # default and a future nixpkgs `mkPackageOption` both look for. Not
+      # required -- the module falls back to callPackage when the overlay is
+      # absent -- but applying it lets you `.override { version = ...; }` the
+      # same way you would upstream.
+      overlays.default = final: _prev: {
+        falcon-sensor = final.callPackage ./pkgs/falcon-sensor.nix { };
+      };
+
       # VM test against a synthetic .deb -- the real installer is proprietary
       # and cannot live in CI. See tests/module.nix.
       checks.${system}.module = import ./tests/module.nix { inherit pkgs self; };

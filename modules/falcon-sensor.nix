@@ -74,8 +74,8 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/falcon-sensor.nix { };
-      defaultText = lib.literalExpression "pkgs.callPackage ../pkgs/falcon-sensor.nix { }";
+      default = pkgs.falcon-sensor or (pkgs.callPackage ../pkgs/falcon-sensor.nix { });
+      defaultText = lib.literalExpression "pkgs.falcon-sensor";
       description = ''
         The Falcon sensor package. The installer it is built from is
         proprietary and must be pinned first with `nix run .#update-sensor`,

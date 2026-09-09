@@ -6,7 +6,7 @@ Two things make this awkward on NixOS, and this flake exists to handle both:
 
 - **The installer is behind an authenticated API.** It cannot be `fetchurl`'d.
   `nix run .#update-sensor` talks to the CrowdStrike Sensor Download API, picks a suitable
-  `.deb`, verifies it, adds it to the Nix store, and pins it in `sensor.lock.json`. After that
+  `.deb`, verifies it, adds it to the Nix store, and records the pin in `pkgs/sources.json`. After that
   the build is pure, cacheable and offline.
 - **The sensor hard-codes `/opt/CrowdStrike` and writes its identity there.** On a tmpfs root
   that is lost every boot. The module relocates all mutable state to a single `/var/lib`
@@ -34,7 +34,7 @@ Two things make this awkward on NixOS, and this flake exists to handle both:
 }
 ```
 
-The module's `package` default builds from `sensor.lock.json`, so pin a sensor first.
+The module's `package` default builds from `pkgs/sources.json`, so pin a sensor first.
 
 ## Pinning a sensor
 
@@ -48,19 +48,29 @@ nix run .#update-sensor -- \
   --client-id-file     /run/secrets/falcon-api-client-id \
   --client-secret-file /run/secrets/falcon-api-client-secret
 
-git add sensor.lock.json && git commit -m "falcon-sensor: pin 7.x.x"
+git add pkgs/sources.json && git commit -m "falcon-sensor: pin 8.x.x"
 ```
 
 The updater discovers your cloud region from the `X-Cs-Region` header, prints your CID, selects
 the newest Debian/Ubuntu `.deb` for the architecture, verifies the download against the SHA-256
-the API declared, and runs `nix-store --add-fixed sha256` on it. `sensor.lock.json` records only
-properties of the installer itself — name, version, hash, target OS and architecture. Nothing in
-it is secret or specific to your tenant, and it is what makes the build reproducible.
+the API declared, runs `nix-store --add-fixed sha256` on it, and records the pin in
+`pkgs/sources.json`. That file holds only properties of the installer itself — name, version,
+hash, target OS and architecture. Nothing in it is secret or specific to your tenant, and it is
+what makes the build reproducible.
+
+Pins accumulate rather than overwrite, keyed by Debian version, so a fleet mid-rollout across
+two sensor versions can select either:
+
+```nix
+services.falcon-sensor.package = pkgs.falcon-sensor.override { version = "8.09.0-19204"; };
+```
+
+With no `version`, the newest pin in the table is used.
 
 Useful flags: `--update-policy platform_default` to take the version from a sensor update
 policy, `--sensor-version` to pin exactly, `--os`/`--os-version`/`--os-regex` to change the
-distro selection, `--filter` to replace the generated FQL outright, and `--dry-run` to see what
-would be selected. `--help` lists everything.
+distro selection, `--filter` to replace the generated FQL outright, `--sources` to write
+somewhere else, and `--dry-run` to see what would be selected. `--help` lists everything.
 
 Because the pin is a flat SHA-256, the store path is reproducible: another machine either
 already has the blob or runs the updater once. No build ever needs credentials or network.
@@ -68,8 +78,18 @@ already has the blob or runs the updater once. No build ever needs credentials o
 If you downloaded the `.deb` from the console by hand instead:
 
 ```bash
-nix-store --add-fixed sha256 falcon-sensor_7.x.x-xxxxx_amd64.deb
+nix-store --add-fixed sha256 falcon-sensor_8.x.x-xxxxx_amd64.deb
 ```
+
+and either add it to `pkgs/sources.json` or pass it inline:
+
+```nix
+services.falcon-sensor.package = pkgs.falcon-sensor.override {
+  name = "falcon-sensor_8.10.0-19402_amd64.deb";
+  hash = "sha256-RVNTBhFgWCM2y2bT4POM6btnvXiOFReoL1LvODFvVs8=";
+};
+```
+
 
 ## Secrets
 
@@ -109,7 +129,7 @@ run the updater; managed endpoints hold no Falcon API keys at all.
 
 The `cid` option is plaintext and lands in the store. That is usually fine — the CID identifies
 your tenant, it does not authenticate — but `cidFile` is there if yours is treated as sensitive.
-`--record-cid` writes the CID into the lockfile; it is off by default because the lockfile is
+`--record-cid` writes the CID into the pin; it is off by default because `pkgs/sources.json` is
 committed.
 
 ### One honest gap
@@ -255,6 +275,38 @@ present in the *new* package would strand the previous version's files forever, 
 large: one stale generation is over 150 MB sitting in the directory an impermanent host
 persists. The setup service therefore records a manifest of what it installed and removes
 anything the next version no longer ships.
+
+## Upstreaming to nixpkgs
+
+The layout is deliberately the shape nixpkgs expects, so moving it upstream is a file move
+rather than a rewrite:
+
+| Here | In nixpkgs |
+| --- | --- |
+| `pkgs/falcon-sensor.nix` + `pkgs/sources.json` | `pkgs/by-name/fa/falcon-sensor/{package.nix,sources.json}` |
+| `modules/falcon-sensor.nix` | `nixos/modules/services/security/falcon-sensor.nix` |
+| `tests/module.nix` | `nixos/tests/falcon-sensor.nix`, wired up as `passthru.tests` |
+
+Three decisions follow from that goal:
+
+- **The pin is a package argument, not a module option.** `version` selects from a
+  version-keyed `sources` table feeding `requireFile` — the same shape as nixpkgs'
+  `cisco-packet-tracer_9`, which is behind an identical login wall. Essentially no NixOS module
+  in the tree exposes a source hash as an option, and a module could not read a pin file anyway:
+  upstream it lives in a different tree from the package.
+- **`sources.json` sits beside the package**, not at the repo root, so it travels with
+  `package.nix` into `pkgs/by-name/`. Keeping a JSON pin next to a package is an existing
+  nixpkgs idiom (`1password-gui`, `acli`, `p3x-onenote`, and others).
+- **The module resolves `pkgs.falcon-sensor` first**, falling back to `callPackage` only when
+  the overlay is absent, so the `package` default collapses to a plain `mkPackageOption`
+  upstream with no behaviour change.
+
+`requireFile` packages are established in nixpkgs — around fifty of them — so an installer that
+cannot be fetched during a build is not itself a blocker. What *is* different from most of them
+is that there is no single canonical version: which sensor a tenant may install is set by that
+tenant's sensor update policy, so the shipped pin is a starting point that any user is expected
+to override. That is also why there is no `passthru.updateScript` — refreshing the pin needs
+CrowdStrike API credentials and cannot run unattended.
 
 ## Packaging notes
 

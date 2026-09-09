@@ -36,9 +36,9 @@ Selection:
   --filter FQL          replace the whole generated FQL filter
 
 Output:
-  --lockfile PATH       default ./sensor.lock.json
-  --record-cid          also write the CID into the lockfile (see README --
-                        the lockfile is committed, so this is off by default)
+  --sources PATH        default ./pkgs/sources.json
+  --record-cid          also write the CID into the pin (see README -- sources.json
+                        is committed, so this is off by default)
   --dry-run             resolve and print the selection, download nothing
   -h, --help            this text
 USAGE
@@ -54,7 +54,7 @@ os_version=""
 os_regex='^(Debian|Ubuntu)$'
 arch="x86_64"
 filter_override=""
-lockfile="sensor.lock.json"
+sourcesfile="pkgs/sources.json"
 record_cid=0
 dry_run=0
 
@@ -70,7 +70,7 @@ while [ $# -gt 0 ]; do
     --os-regex)           os_regex="$2"; shift 2 ;;
     --arch)               arch="$2"; shift 2 ;;
     --filter)             filter_override="$2"; shift 2 ;;
-    --lockfile)           lockfile="$2"; shift 2 ;;
+    --sources)            sourcesfile="$2"; shift 2 ;;
     --record-cid)         record_cid=1; shift ;;
     --dry-run)            dry_run=1; shift ;;
     -h|--help)            usage; exit 0 ;;
@@ -307,20 +307,37 @@ echo "update-sensor: verified sha256 $sha256" >&2
 store_path="$(nix-store --add-fixed sha256 "$deb")"
 echo "update-sensor: added to the store as $store_path" >&2
 
-lock="$(jq -n \
-  --arg name "$name" --arg version "$version" --arg sha256 "$sha256" \
+# requireFile takes SRI; the API reports hex.
+sri="$(nix hash convert --hash-algo sha256 --to sri "$sha256")"
+
+# The deb version ("8.10.0-19402") keys the table, because that is what
+# `pkgs.falcon-sensor.override { version = ...; }` selects. The API's own
+# `version` field ("8.10.19402") is kept alongside as the package version.
+entry="$(jq -n \
+  --arg name "$name" --arg version "$version" --arg hash "$sri" \
   --arg os "$sel_os" --arg os_version "$sel_osver" \
   --arg arch "$arch" \
   --arg retrieved "$(date -u +%Y-%m-%d)" \
-  '{name:$name, version:$version, sha256:$sha256, os:$os,
+  '{name:$name, version:$version, hash:$hash, os:$os,
     os_version:$os_version, arch:$arch, retrieved:$retrieved}')"
 
 if [ "$record_cid" -eq 1 ] && [ -n "$cid" ]; then
-  lock="$(jq --arg cid "$cid" '. + {cid:$cid}' <<<"$lock")"
+  entry="$(jq --arg cid "$cid" '. + {cid:$cid}' <<<"$entry")"
 fi
 
-printf '%s\n' "$lock" > "$lockfile"
-chmod 644 "$lockfile"
+# Merge rather than overwrite: older pins stay selectable via `override`, which
+# matters when a fleet is mid-rollout across two sensor versions.
+deb_version="$(printf '%s' "$name" | sed -n 's/^falcon-sensor_\(.*\)_[^_]*\.deb$/\1/p')"
+[ -n "$deb_version" ] || deb_version="$version"
 
-echo "update-sensor: wrote $lockfile" >&2
+existing='{}'
+if [ -f "$sourcesfile" ]; then existing="$(cat "$sourcesfile")"; fi
+
+printf '%s\n' "$existing" \
+  | jq --sort-keys --arg k "$deb_version" --argjson v "$entry" '. + {($k): $v}' \
+  > "$sourcesfile.new"
+mv -- "$sourcesfile.new" "$sourcesfile"
+chmod 644 "$sourcesfile"
+
+echo "update-sensor: recorded $deb_version in $sourcesfile" >&2
 echo "update-sensor: commit it -- it holds no secrets, and it is what makes the build reproducible" >&2

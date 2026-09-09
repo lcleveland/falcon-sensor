@@ -5,21 +5,33 @@
   dpkg,
   autoPatchelfHook,
   patchelf,
-  # Runtime libraries the sensor links against. This set is a starting point --
-  # verify it against a real .deb with `readelf -d` (see README "Packaging
-  # notes") and extend it rather than reaching for autoPatchelfIgnoreMissingDeps,
-  # which would turn a missing library into a runtime crash instead of a build
-  # failure.
+  # Runtime libraries the sensor links against. Confirmed sufficient for 8.10 --
+  # verify against a new .deb with `readelf -d` (see README "Packaging notes")
+  # and extend rather than reaching for autoPatchelfIgnoreMissingDeps, which
+  # would turn a missing library into a runtime crash instead of a build failure.
   openssl,
   libnl,
   zlib,
   elfutils,
   libbpf,
 
-  # Pin produced by `nix run .#update-sensor` (tools/update-sensor.sh).
-  lockFile ? ../sensor.lock.json,
+  # Which pin from ./sources.json to build. Defaults to the newest one there.
+  # The sensor version a tenant may install is set by its own sensor update
+  # policy, so this is expected to be overridden:
+  #
+  #   pkgs.falcon-sensor.override { version = "8.09.0-19204"; }
+  #
+  # `nix run .#update-sensor` adds pins to sources.json.
+  version ? null,
 
-  # Explicit source override (path/derivation); wins over the lockfile. Used by
+  # For a version that is not in sources.json. Both must be given together;
+  # they take precedence over the table.
+  name ? null,
+  hash ? null,
+
+  sourcesFile ? ./sources.json,
+
+  # Explicit source override (path/derivation); wins over everything. Used by
   # the VM test to substitute a synthetic .deb.
   #
   # Deliberately NOT named `src`: callPackage auto-fills any argument whose name
@@ -27,26 +39,38 @@
   # nixpkgs carries a *throwing* `pkgs.src` rename alias, so an argument named
   # `src` gets resolved to that alias and aborts evaluation as soon as the
   # source is forced. `srcOverride` collides with nothing, so the default holds.
-  # (Same lesson as netskope-client/pkgs/netskope-client.nix.)
   srcOverride ? null,
 }:
 
 let
-  hasLock = lockFile != null && builtins.pathExists lockFile;
-  lock = if hasLock then builtins.fromJSON (builtins.readFile lockFile) else null;
+  sources = if builtins.pathExists sourcesFile then lib.importJSON sourcesFile else { };
+
+  # Debian version ordering: 8.10.0-19402 sorts above 8.9.0-19204 numerically,
+  # not lexically, so compare component-wise.
+  versionKeys = lib.sort (a: b: builtins.compareVersions a b < 0) (builtins.attrNames sources);
+  newest = if versionKeys == [ ] then null else lib.last versionKeys;
+
+  selected = if version != null then version else newest;
+
+  pin =
+    if name != null && hash != null then
+      { inherit name hash; }
+    else if selected != null && sources ? ${selected} then
+      sources.${selected}
+    else
+      null;
 
   # The sensor is proprietary and sits behind an authenticated API, so it can
   # never be fetched during a build. The updater downloads it once, verifies the
-  # sha256 the API declared, and does `nix-store --add-fixed sha256` -- which is
-  # exactly the flat hash requireFile resolves. From then on the build is pure
-  # and offline, and any other machine either has the blob already or runs the
+  # hash the API declared, and does `nix-store --add-fixed sha256` -- which is
+  # exactly what requireFile resolves. From then on the build is pure and
+  # offline, and any other machine either has the blob already or runs the
   # updater once.
-  lockedSrc = requireFile {
-    name = lock.name;
-    sha256 = lock.sha256;
+  pinnedSrc = requireFile {
+    inherit (pin) name hash;
+    url = "https://falcon.crowdstrike.com/host-management/sensor-downloads";
     message = ''
-      The Falcon sensor installer ${lock.name} (version ${lock.version}) is
-      pinned in ${toString lockFile} but is not in the Nix store.
+      The Falcon sensor installer ${pin.name} is pinned but is not in the Nix store.
 
       Fetch it from the CrowdStrike API and add it:
 
@@ -57,41 +81,64 @@ let
       Or, if you downloaded it from the Falcon console by hand
       (Host setup and management -> Sensor downloads):
 
-        nix-store --add-fixed sha256 ${lock.name}
+        nix-store --add-fixed sha256 ${pin.name}
 
-      Expected sha256: ${lock.sha256}
+      Expected hash: ${pin.hash}
     '';
   };
 
   unpinnedSrc = requireFile {
     name = "falcon-sensor.deb";
     hash = lib.fakeHash;
-    message = ''
-      No sensor is pinned yet -- ${toString lockFile} does not exist.
+    message =
+      if version != null then
+        ''
+          No pin for falcon-sensor version ${version} in ${toString sourcesFile}.
 
-      Pin one from the CrowdStrike Sensor Download API (needs an API client with
-      the "Sensor Download: read" scope):
+          Available: ${if versionKeys == [ ] then "(none)" else lib.concatStringsSep ", " versionKeys}
 
-        nix run .#update-sensor -- \
-          --client-id-file     /run/secrets/falcon-api-client-id \
-          --client-secret-file /run/secrets/falcon-api-client-secret
+          Add one with `nix run .#update-sensor -- --sensor-version ${version}`,
+          or pass `name` and `hash` directly:
 
-      That writes sensor.lock.json (commit it -- it holds no secrets) and adds
-      the installer to the store. See README "Pinning a sensor".
-    '';
+            pkgs.falcon-sensor.override {
+              name = "falcon-sensor_${version}_amd64.deb";
+              hash = "sha256-...";
+            }
+        ''
+      else
+        ''
+          No sensor is pinned yet -- ${toString sourcesFile} has no entries.
+
+          Pin one from the CrowdStrike Sensor Download API (needs an API client
+          with the "Sensor Download: read" scope):
+
+            nix run .#update-sensor -- \
+              --client-id-file     /run/secrets/falcon-api-client-id \
+              --client-secret-file /run/secrets/falcon-api-client-secret
+
+          That records the pin in sources.json (commit it -- it holds nothing
+          secret and nothing specific to your tenant) and adds the installer to
+          the store. See README "Pinning a sensor".
+        '';
   };
 
   resolvedSrc =
     if srcOverride != null then
       srcOverride
-    else if hasLock then
-      lockedSrc
+    else if pin != null then
+      pinnedSrc
     else
       unpinnedSrc;
 in
 stdenv.mkDerivation {
   pname = "falcon-sensor";
-  version = if hasLock then lock.version else "0-unpinned";
+  version =
+    if pin != null && pin ? version then
+      pin.version
+    else if selected != null then
+      selected
+    else
+      "0-unpinned";
 
   src = resolvedSrc;
 
@@ -135,9 +182,9 @@ stdenv.mkDerivation {
     mkdir -p "$out"
     cp -a opt "$out/opt"
 
-    # Keep the vendor's own unit around: the module mirrors its settings rather
-    # than inventing them, and the bind mount means its hard-coded paths are
-    # already correct on a running system.
+    # Keep the vendor's own unit around: services.falcon-sensor.useVendorUnit
+    # uses it directly, and the bind mount means its hard-coded paths already
+    # resolve on a running system.
     for d in lib/systemd/system usr/lib/systemd/system; do
       if [ -d "$d" ]; then
         mkdir -p "$out/lib/systemd/system"
@@ -161,7 +208,10 @@ stdenv.mkDerivation {
     # The sensor hard-codes this path; the module materialises it as a bind
     # mount over its state directory.
     installDir = "/opt/CrowdStrike";
-    inherit lock;
+    inherit sources;
+    # Deliberately no updateScript: refreshing this pin needs CrowdStrike API
+    # credentials and returns whatever version the tenant's sensor update policy
+    # allows, so it cannot run unattended. Use tools/update-sensor.sh.
   };
 
   meta = {
