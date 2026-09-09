@@ -11,10 +11,12 @@
       pkgs = import nixpkgs { inherit system; };
 
       falcon-sensor-fetch = pkgs.callPackage ./pkgs/falcon-sensor-fetch.nix { };
+      falcon-sensor-status = pkgs.callPackage ./pkgs/falcon-sensor-status.nix { };
+      falcon-sensor-tray = pkgs.callPackage ./pkgs/falcon-sensor-tray.nix { };
     in
     {
       packages.${system} = {
-        inherit falcon-sensor-fetch;
+        inherit falcon-sensor-fetch falcon-sensor-status falcon-sensor-tray;
         default = falcon-sensor-fetch;
       };
 
@@ -41,6 +43,8 @@
       # callPackage when the overlay is absent.
       overlays.default = final: _prev: {
         falcon-sensor-fetch = final.callPackage ./pkgs/falcon-sensor-fetch.nix { };
+        falcon-sensor-status = final.callPackage ./pkgs/falcon-sensor-status.nix { };
+        falcon-sensor-tray = final.callPackage ./pkgs/falcon-sensor-tray.nix { };
       };
 
       # VM test against a synthetic sensor -- the real installer is proprietary
@@ -58,6 +62,9 @@
           curl
           jq
           shellcheck
+          # For iterating on the tray icon outside a rebuild.
+          (python3.withPackages (ps: [ ps.pygobject3 ]))
+          libayatana-appindicator
         ];
       };
     };

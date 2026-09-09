@@ -213,6 +213,70 @@ sensor misbehaves. On an impermanent host that log is lost at reboot unless `/va
 persisted separately — that is normal and nothing the sensor depends on.
 
 
+## Seeing the state: the status file and the tray icon
+
+RFM is the state you most want to notice and the one nothing tells you about, and `falconctl`
+is root-only (mode 0500) — so nothing in a desktop session can ask the sensor anything at all.
+
+Two pieces, either usable on its own:
+
+```nix
+services.falcon-sensor.tray.enable = true;              # icon in the session's tray
+services.falcon-sensor.status.enable = true;            # just the file (implied by the tray)
+services.falcon-sensor.status.includeIdentifiers = true; # also publish the AID and CID
+```
+
+`status.enable` runs `falconctl -g` from a root oneshot on a timer and writes
+`/run/falcon-sensor/status.json`, world-readable:
+
+```json
+{
+  "generated": "2026-09-09T20:37:08Z",
+  "generated_epoch": 1788986228,
+  "interval_seconds": 60,
+  "service": { "active_state": "active", "sub_state": "running" },
+  "sensor": {
+    "queryable": true,
+    "version": "8.10.0-19402",
+    "rfm": true,
+    "rfm_reason": "Unsupported kernel",
+    "registered": true,
+    "backend": "bpf"
+  }
+}
+```
+
+That is the whole privileged surface: one program that only performs `falconctl -g` reads.
+Nothing else needs a sudo rule, a setuid wrapper or a polkit action, and a status bar needs no
+privileges whatsoever. **No secrets go in the file** — the Agent ID and the CID appear only
+under `status.includeIdentifiers`, which is off by default because every local user can read
+it. `registered` is published either way, derived from whether an AID exists rather than from
+its value. `queryable: false` means the fields below it were never asked (an unprivileged run,
+or a sensor not fetched yet) as opposed to being unset — the difference between "no answer" and
+"a healthy sensor with no version". Read the path from `services.falcon-sensor.status.path`
+rather than hardcoding it; it is a read-only option for exactly that.
+
+`tray.enable` adds a StatusNotifierItem from a `graphical-session.target` user service, so it
+lands in whatever tray the session already has — Quickshell/DankMaterialShell, waybar, KDE, an
+AppIndicator-capable GNOME — rather than being written against one shell's widget API. Four
+states, by glyph as well as colour:
+
+| icon | state | meaning |
+| --- | --- | --- |
+| green tick | protected | running, registered, out of RFM |
+| amber `!` | degraded | in RFM, or no Agent ID yet |
+| red `✕` | inactive | `falcon-sensor.service` is not running |
+| grey `–` | unknown | nothing is publishing, or the file is three intervals stale |
+
+Clicking it shows the version, the unit state, the RFM reason and when the status was last
+refreshed. It is strictly read-only: nothing in it can start, stop or reconfigure a security
+agent from a desktop session, so enabling it hands the session no privilege over the sensor.
+
+`falcon-sensor-tray --print-state` resolves the same states on stdout with no display and no
+session bus, which is both how the VM test covers the logic and the quickest way to see what
+the icon is reacting to.
+
+
 ## The systemd unit, and prior art
 
 Sensor 8.10.0-19402 ships its own unit, which this module reproduces rather than guesses at:
@@ -278,7 +342,7 @@ The binaries are never stripped — the sensor is signed and self-checking.
 ```bash
 nix flake check     # evaluates everything and runs the VM test
 nix fmt
-nix develop         # dpkg, patchelf, readelf, curl, jq, shellcheck
+nix develop         # dpkg, patchelf, readelf, curl, jq, shellcheck, python3+pygobject
 ```
 
 The VM test in `tests/module.nix` substitutes a stub for `falcon-sensor-fetch` with the same
@@ -288,11 +352,17 @@ a sensor it already has, that bumping the hash upgrades while `preserveFiles` ke
 and the old version's files are not stranded, the `falconctl` argv, and that no credential
 reaches a unit file or the journal.
 
+The stub `falconctl` also answers `-g` reads in the several formats the real one uses, which is
+what covers the status file: its contents, its mode, that identifiers appear only where they
+were asked for, that no secret reaches it, and the tray's state machine driven as `nobody`
+through `--print-state`. Drawing the icon is not tested — that would need a graphical session
+and a StatusNotifierItem host.
+
 ## Status
 
 The API flow was verified end-to-end against a real tenant with sensor **8.10.0-19402**:
 authentication with us-1 → us-2 region autodiscover, CID lookup, installer selection, download,
-and checksum verification. The module is covered by a 9-subtest NixOS VM test.
+and checksum verification. The module is covered by a 12-subtest NixOS VM test.
 
 What that leaves:
 
@@ -303,3 +373,6 @@ What that leaves:
   authentication, selection and download; the unpack-and-patch half is covered only by the VM
   test's stub.
 - **Expect RFM.** See above; nothing about the packaging changes that.
+- **The tray icon has not been watched in a real tray.** Its state machine is covered by the
+  VM test, and the status file it renders is real, but whether a given tray host resolves the
+  bundled icon names through `IconThemePath` is host-specific and only a session can answer.

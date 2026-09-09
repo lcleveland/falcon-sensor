@@ -16,10 +16,30 @@ let
     pkgs.runCommand "falcon-sensor-stub-${version}" { } ''
       mkdir -p "$out/opt/CrowdStrike/subdir"
 
-      # Records every invocation so the test can assert on the argv the module
+      # Answers `-g` reads in the formats the real falconctl uses -- which are
+      # not one format but several, including a sentence for anything unset --
+      # and records every *write* so the test can assert on the argv the module
       # built, including values it read from credentials.
+      #
+      # Reads are deliberately not logged: falcon-sensor-status runs `-g` from a
+      # timer, so logging those would interleave with the writes and break the
+      # assertion that the maintenance token is applied first.
       cat > "$out/opt/CrowdStrike/falconctl${version}" <<EOF
       #!${pkgs.runtimeShell}
+      if [ "\$1" = "-g" ]; then
+        shift
+        for flag in "\$@"; do
+          case "\$flag" in
+            --version)    echo "version = 8.10.0-${version}." ;;
+            --rfm-state)  echo "rfm-state=true." ;;
+            --rfm-reason) echo "rfm-reason=Unsupported kernel." ;;
+            --backend)    echo "backend=bpf." ;;
+            --aid)        echo 'aid="0123456789abcdef0123456789abcdef".' ;;
+            --cid)        echo "cid is not set." ;;
+          esac
+        done
+        exit 0
+      fi
       printf "%s\n" "\$*" >> /opt/CrowdStrike/falconctl.log
       exit 0
       EOF
@@ -103,6 +123,12 @@ let
     "sha256-new" = stubSensor "19402";
   };
 
+  # Driven directly in the test script, as an unprivileged user, to check the
+  # state machine the icon renders. The icon itself is not tested here: drawing it
+  # needs a graphical session and a StatusNotifierItem host, which is what
+  # --print-state exists to sidestep.
+  trayPkg = pkgs.callPackage ../pkgs/falcon-sensor-tray.nix { };
+
   # Writes credential files at runtime from /dev/urandom, so the values exist
   # nowhere in the Nix store and the leak assertions are meaningful rather than
   # circular.
@@ -143,6 +169,9 @@ pkgs.testers.runNixOSTest {
         "Team/Platform"
       ];
       backend = "bpf";
+      # Turns the status publisher on through its default, and brings up the
+      # user service that would draw the icon in a real session.
+      tray.enable = true;
       api = {
         package = fetchStub;
         clientIdFile = "/run/falcon-test-secrets/client-id";
@@ -166,6 +195,12 @@ pkgs.testers.runNixOSTest {
       enable = true;
       cidFile = "/run/falcon-test-secrets/cid";
       maintenanceTokenFile = "/run/falcon-test-secrets/maintenance-token";
+      # No tray on this one: the publisher stands on its own, and this is where
+      # the opt-in identifiers are exercised.
+      status = {
+        enable = true;
+        includeIdentifiers = true;
+      };
       api = {
         package = fetchStub;
         clientIdFile = "/run/falcon-test-secrets/client-id";
@@ -183,6 +218,8 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import json
+
     pinned.wait_for_unit("multi-user.target")
     tracking.wait_for_unit("multi-user.target")
 
@@ -238,6 +275,69 @@ pkgs.testers.runNixOSTest {
     with subtest("the sensor daemon runs"):
         pinned.wait_for_unit("falcon-sensor.service")
         pinned.succeed("systemctl is-active falcon-sensor.service")
+
+    with subtest("the sensor's state is published for unprivileged readers"):
+        pinned.succeed("systemctl start falcon-sensor-status.service")
+        pinned.wait_for_file("/run/falcon-sensor/status.json")
+
+        mode = pinned.succeed("stat -c %a /run/falcon-sensor/status.json").strip()
+        assert mode == "644", f"status file is mode {mode}; a session must be able to read it"
+
+        status = json.loads(pinned.succeed("cat /run/falcon-sensor/status.json"))
+        assert status["sensor"]["queryable"] is True, status
+        assert status["sensor"]["rfm"] is True, status
+        assert status["sensor"]["rfm_reason"] == "Unsupported kernel", status
+        assert status["sensor"]["registered"] is True, status
+        assert status["sensor"]["backend"] == "bpf", status
+        assert status["sensor"]["version"].startswith("8.10.0-"), status
+        assert status["service"]["active_state"] == "active", status
+
+        # World-readable file, so the identifiers stay out of it unless asked for.
+        assert "identifiers" not in status, status
+
+        # Same reasoning as the leak subtest above: nothing secret may reach a
+        # file every local user can read.
+        for secret in (token, api_id, api_sec):
+            pinned.fail(f"grep -q {secret} /run/falcon-sensor/status.json")
+
+        # The timer keeps it fresh, and a sensor restart refreshes it at once
+        # rather than leaving a stale answer up for an interval.
+        pinned.succeed("systemctl is-active falcon-sensor-status.timer")
+        wants = pinned.succeed("systemctl show falcon-sensor.service --property=Wants --value")
+        assert "falcon-sensor-status.service" in wants, wants
+
+    with subtest("the tray resolves that state with no privileges at all"):
+        tray = "${trayPkg}/bin/falcon-sensor-tray"
+
+        def tray_state(machine, path):
+            out = machine.succeed(
+                f"su -s /bin/sh nobody -c '{tray} --status-file {path} --print-state'"
+            )
+            return out.splitlines()[0]
+
+        # This host is in RFM, which is the case the icon exists for.
+        assert tray_state(pinned, "/run/falcon-sensor/status.json") == "degraded"
+
+        # Nothing publishing, and a publisher that has stopped publishing, are
+        # both "unknown" -- never a reassuring stale answer.
+        assert tray_state(pinned, "/run/falcon-sensor/absent.json") == "unknown"
+        pinned.succeed(
+            "sed -e 's/\"generated_epoch\": *[0-9]*/\"generated_epoch\": 1/'"
+            " /run/falcon-sensor/status.json > /tmp/stale.json"
+        )
+        assert tray_state(pinned, "/tmp/stale.json") == "unknown"
+
+        # The user service that would draw it in a session is wired up.
+        pinned.succeed("test -e /etc/systemd/user/falcon-sensor-tray.service")
+
+    with subtest("identifiers are published only where they were asked for"):
+        tracking.succeed("systemctl start falcon-sensor-status.service")
+        tracking.wait_for_file("/run/falcon-sensor/status.json")
+        status = json.loads(tracking.succeed("cat /run/falcon-sensor/status.json"))
+        assert status["identifiers"]["aid"] == "0123456789abcdef0123456789abcdef", status
+        # The stub reports the CID as unset, which is the "... is not set."
+        # parse path rather than a value.
+        assert status["identifiers"]["cid"] is None, status
     with subtest("bumping the hash upgrades but keeps the sensor's identity"):
         # falconstore carries the AID; preserveFiles must carry it across.
         pinned.succeed("echo AID-I-MUST-KEEP > /opt/CrowdStrike/falconstore")

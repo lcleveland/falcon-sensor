@@ -73,6 +73,10 @@ let
     )
     ++ cfg.extraFalconctlArgs;
 
+  # The RuntimeDirectory= holding cfg.status.path, derived rather than repeated so
+  # the option and the unit cannot drift apart.
+  statusRuntimeDir = lib.removePrefix "/run/" (builtins.dirOf cfg.status.path);
+
   isAbsolute = p: lib.hasPrefix "/" p;
   inStore = p: lib.hasPrefix builtins.storeDir p;
 in
@@ -436,6 +440,105 @@ in
         Do not put secrets here: the value lands in the Nix store.
       '';
     };
+
+    status = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = cfg.tray.enable;
+        defaultText = lib.literalExpression "config.services.falcon-sensor.tray.enable";
+        description = ''
+          Publish the sensor's state to {option}`status.path`, as JSON, on a timer.
+
+          `falconctl` is root-only, so nothing in a user session -- a tray icon, a
+          status bar, a script running as a normal user -- can ask the sensor how
+          it is doing. This runs `falconctl -g` as root and leaves the answer in a
+          world-readable file for them to read instead.
+
+          The file carries the sensor version, the unit's state, whether the host
+          has registered, and the RFM state and reason. It carries no secrets: the
+          Agent ID and the CID appear only under
+          {option}`status.includeIdentifiers`.
+        '';
+      };
+
+      interval = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 60;
+        description = ''
+          Seconds between refreshes of {option}`status.path`.
+
+          The value is recorded in the file itself, so a reader can tell a current
+          answer from a stale one: the tray reports "unknown" once three intervals
+          have passed without a refresh, rather than a reassuring but stale
+          "protected".
+        '';
+      };
+
+      includeIdentifiers = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Also publish the Agent ID and the CID in {option}`status.path`.
+
+          Off by default: that file is readable by every local user, while this
+          module otherwise goes to some length to keep the CID out of
+          world-readable places (see {option}`cidFile`). Registration state is
+          published either way, derived from whether an AID exists rather than
+          from its value.
+        '';
+      };
+
+      path = lib.mkOption {
+        type = lib.types.str;
+        readOnly = true;
+        default = "/run/falcon-sensor/status.json";
+        description = ''
+          Where the published status lands. Read-only; exposed so a status bar can
+          be pointed at it without hardcoding the path -- e.g. a waybar
+          `custom/falcon` module reading it with `jq`.
+
+          Under /run on purpose: it is derived state, meaningless after a reboot,
+          and nothing here needs persisting.
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.falcon-sensor-status or (pkgs.callPackage ../pkgs/falcon-sensor-status.nix { });
+        defaultText = lib.literalExpression "pkgs.falcon-sensor-status";
+        description = "The tool that queries `falconctl` and writes {option}`status.path`.";
+      };
+    };
+
+    tray = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Show the sensor's state as a tray icon in the user's session, from a
+          `graphical-session.target` user service.
+
+          CrowdStrike ships no GUI for Linux, so this is a small
+          StatusNotifierItem of this module's own: it appears in whatever tray the
+          session already has and renders {option}`status.path`. Four states --
+          protected, degraded (in RFM, or not yet registered), not running, and
+          unknown (nothing is publishing a status). Clicking it shows the version,
+          the unit state and the RFM reason.
+
+          Strictly read-only: nothing in it can start, stop or reconfigure the
+          sensor, so no privilege over the security agent is handed to the session.
+
+          Off by default; this module's usual host is headless.
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.falcon-sensor-tray or (pkgs.callPackage ../pkgs/falcon-sensor-tray.nix { });
+        defaultText = lib.literalExpression "pkgs.falcon-sensor-tray";
+        description = "The tray icon program, which also carries its own icons.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -467,6 +570,15 @@ in
       {
         assertion = cfg.proxy.enable -> cfg.proxy.host != "";
         message = "services.falcon-sensor.proxy.host must be set when proxy.enable is true.";
+      }
+      {
+        assertion = cfg.tray.enable -> cfg.status.enable;
+        message = ''
+          services.falcon-sensor.tray.enable needs status.enable: the tray renders
+          ${cfg.status.path} and cannot read falconctl itself -- it runs as an
+          unprivileged user, and falconctl is root-only. Leave status.enable at its
+          default, or set it to true.
+        '';
       }
     ]
     ++ map (c: {
@@ -505,7 +617,14 @@ in
         must reach the API to find out which. Pin it -- see `find-sensor`.
       '';
 
-    environment.systemPackages = [ cfg.api.package ];
+    environment.systemPackages = [
+      cfg.api.package
+    ]
+    # `sudo falcon-sensor-status` is a useful thing to have next to falconctl.
+    ++ lib.optional cfg.status.enable cfg.status.package
+    # Also puts the tray's icons in the system icon theme, for hosts that
+    # resolve tray icon names through it rather than through IconThemePath.
+    ++ lib.optional cfg.tray.enable cfg.tray.package;
 
     # Fetch the sensor, and relocate its state. This is also the reason the
     # module works on a tmpfs root.
@@ -669,6 +788,92 @@ in
       }
       // lib.optionalAttrs (cfg.pidFile != null) { PIDFile = cfg.pidFile; }
       // lib.optionalAttrs (cfg.restart != "no") { RestartSec = 5; };
+    };
+
+    # Make the sensor's state readable without root.
+    #
+    # falconctl is mode 0500 and owned by root, so a session cannot ask the sensor
+    # anything: the tray icon, a status bar, an unprivileged health check all get
+    # "Permission denied". Rather than handing any of them a way to run falconctl
+    # -- sudo rules, a setuid wrapper, a polkit action on the unit -- one root
+    # oneshot asks and publishes the answer, and everything else reads a file.
+    #
+    # That keeps the privileged surface at exactly one program which only ever
+    # performs `falconctl -g` reads, and it means a status bar needs no privileges
+    # at all. See tools/falcon-sensor-status.sh for what does and does not go in
+    # the file.
+    systemd.services.falcon-sensor-status = lib.mkIf cfg.status.enable {
+      description = "Publish the CrowdStrike Falcon sensor's state";
+      # Pulled in by the sensor itself, so starting or restarting the sensor
+      # refreshes the file at once instead of leaving a stale answer up for a
+      # timer interval.
+      wantedBy = [ "falcon-sensor.service" ];
+      # falconctl does not exist until the fetch has bind-mounted it into place.
+      after = [ "falcon-sensor-fetch.service" ];
+      requires = [ "falcon-sensor-fetch.service" ];
+      unitConfig.RequiresMountsFor = cfg.statePath;
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.concatStringsSep " " (
+          [
+            (lib.getExe cfg.status.package)
+            "--install-dir ${installDir}"
+            "--output ${cfg.status.path}"
+            "--interval ${toString cfg.status.interval}"
+          ]
+          ++ lib.optional cfg.status.includeIdentifiers "--identifiers"
+        );
+
+        # 0755 on the directory and 0644 on the file: the whole point is that an
+        # unprivileged reader can get at it. RuntimeDirectoryPreserve is not
+        # optional here -- without it systemd removes the directory the moment
+        # this oneshot exits, taking the file with it.
+        RuntimeDirectory = statusRuntimeDir;
+        RuntimeDirectoryMode = "0755";
+        RuntimeDirectoryPreserve = "yes";
+
+        # Kept to the two directives that cannot change what a vendor binary can
+        # see of the system it inspects. Locking this down further -- an address
+        # family allowlist, a namespaced /proc -- risks falconctl quietly
+        # answering "unset" for everything, which the tray would faithfully
+        # display as a healthy sensor with no version.
+        ProtectHome = true;
+        NoNewPrivileges = true;
+      };
+    };
+
+    systemd.timers.falcon-sensor-status = lib.mkIf cfg.status.enable {
+      description = "Refresh the published CrowdStrike Falcon sensor state";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "30s";
+        OnUnitActiveSec = "${toString cfg.status.interval}s";
+        # A status display does not need second-accurate timers, and this lets
+        # systemd batch the wakeups.
+        AccuracySec = "10s";
+        Unit = "falcon-sensor-status.service";
+      };
+    };
+
+    # The tray icon, in the user's session.
+    #
+    # Its lifecycle belongs to systemd rather than to an XDG autostart entry, so
+    # it comes back with the session and gets restarted if it dies -- the same
+    # reasoning as the netskope module's stagentui unit, except that there is no
+    # vendor UI to run here and this is our own StatusNotifierItem.
+    systemd.user.services.falcon-sensor-tray = lib.mkIf cfg.tray.enable {
+      description = "CrowdStrike Falcon sensor tray icon";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${lib.getExe cfg.tray.package} --status-file ${cfg.status.path}";
+        # A tray host that is not up yet, or a shell being restarted, should not
+        # leave the session without an icon.
+        Restart = "on-failure";
+        RestartSec = 5;
+      };
     };
   };
 }
