@@ -310,10 +310,10 @@ echo "update-sensor: added to the store as $store_path" >&2
 lock="$(jq -n \
   --arg name "$name" --arg version "$version" --arg sha256 "$sha256" \
   --arg os "$sel_os" --arg os_version "$sel_osver" \
-  --arg arch "$arch" --arg cloud "$cloud" \
+  --arg arch "$arch" \
   --arg retrieved "$(date -u +%Y-%m-%d)" \
   '{name:$name, version:$version, sha256:$sha256, os:$os,
-    os_version:$os_version, arch:$arch, cloud:$cloud, retrieved:$retrieved}')"
+    os_version:$os_version, arch:$arch, retrieved:$retrieved}')"
 
 if [ "$record_cid" -eq 1 ] && [ -n "$cid" ]; then
   lock="$(jq --arg cid "$cid" '. + {cid:$cid}' <<<"$lock")"

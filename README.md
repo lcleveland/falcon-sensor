@@ -53,8 +53,9 @@ git add sensor.lock.json && git commit -m "falcon-sensor: pin 7.x.x"
 
 The updater discovers your cloud region from the `X-Cs-Region` header, prints your CID, selects
 the newest Debian/Ubuntu `.deb` for the architecture, verifies the download against the SHA-256
-the API declared, and runs `nix-store --add-fixed sha256` on it. `sensor.lock.json` records the
-name, version and hash — **no secrets** — and is what makes the build reproducible.
+the API declared, and runs `nix-store --add-fixed sha256` on it. `sensor.lock.json` records only
+properties of the installer itself — name, version, hash, target OS and architecture. Nothing in
+it is secret or specific to your tenant, and it is what makes the build reproducible.
 
 Useful flags: `--update-policy platform_default` to take the version from a sensor update
 policy, `--sensor-version` to pin exactly, `--os`/`--os-version`/`--os-regex` to change the
