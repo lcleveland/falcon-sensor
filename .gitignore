@@ -1,0 +1,18 @@
+# Nix build outputs
+result
+result-*
+
+# Editor / OS cruft
+.direnv/
+*.swp
+.DS_Store
+
+# Never commit the proprietary, non-redistributable sensor installer
+*.deb
+falcon-sensor_*.deb
+
+# Never commit credentials. The module and the updater take *paths* to runtime
+# files (see README "Secrets"); nothing secret belongs in this tree.
+*.age
+*.key
+secrets/
