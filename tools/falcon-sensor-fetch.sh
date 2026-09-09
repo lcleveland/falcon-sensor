@@ -13,7 +13,7 @@
 
 usage() {
   cat <<'USAGE'
-update-sensor -- pin a Falcon sensor installer from the CrowdStrike API
+falcon-sensor-fetch -- download and install a Falcon sensor from the CrowdStrike API
 
 Credentials (required; needs the "Sensor Download: read" API scope):
   --client-id-file PATH      absolute path to a file holding the API client id
@@ -22,26 +22,33 @@ Credentials (required; needs the "Sensor Download: read" API scope):
                              Never pass a secret as an argument -- argv is world
                              readable through /proc.
 
-Selection:
-  --cloud REGION        autodiscover (default) | us-1 | us-2 | us-3 | eu-1
-                        | us-gov-1 | us-gov-2
-  --sensor-version VER  pin an exact sensor version (e.g. 7.20.0-17306)
+Selecting a sensor:
+  --hash HASH           install exactly this sensor. Accepts an SRI hash
+                        (sha256-...) or bare hex. This is the sha256 of the
+                        installer, which is also the API's id for it, so it
+                        both selects and verifies. Takes precedence over
+                        everything below.
   --update-policy NAME  take the version from a sensor update policy
                         (e.g. platform_default). Needs the
                         "Sensor update policies: read" scope.
+  --sensor-version VER  an exact sensor version (e.g. 8.10.0-19402)
+  --cloud REGION        autodiscover (default) | us-1 | us-2 | us-3 | eu-1
+                        | us-gov-1 | us-gov-2
   --os NAME             FQL os filter (e.g. Debian, Ubuntu)
   --os-version VER      FQL os_version filter (e.g. 12/13)
   --os-regex RE         client-side os filter, default ^(Debian|Ubuntu)$
   --arch ARCH           x86_64 (default) or arm64
   --filter FQL          replace the whole generated FQL filter
 
-Output:
-  --sources PATH        default ./pkgs/sources.json
-  --install-dir DIR     install straight into DIR instead of pinning: unpack,
-                        patch the ELF headers for this host, and keep the
-                        sensor identity files. Used by falcon-sensor-refresh.
-  --record-cid          also write the CID into the pin (see README -- sources.json
-                        is committed, so this is off by default)
+Modes:
+  --list                print every matching sensor with its SRI hash, for
+                        pasting into services.falcon-sensor.hash, then exit
+  --preserve "A B C"    space-separated basenames carried across an in-place
+                        upgrade, default "falconstore falconstore.bak falconctl.conf"
+  --install-dir DIR     download, verify, unpack, patch the ELF headers for
+                        this host and install into DIR, keeping the sensor's
+                        identity files. A no-op when DIR already holds the
+                        requested sensor.
   --dry-run             resolve and print the selection, download nothing
   -h, --help            this text
 USAGE
@@ -57,9 +64,10 @@ os_version=""
 os_regex='^(Debian|Ubuntu)$'
 arch="x86_64"
 filter_override=""
-sourcesfile="pkgs/sources.json"
+target_hash=""
+list_only=0
+preserve="falconstore falconstore.bak falconctl.conf"
 install_dir=""
-record_cid=0
 dry_run=0
 
 while [ $# -gt 0 ]; do
@@ -74,16 +82,33 @@ while [ $# -gt 0 ]; do
     --os-regex)           os_regex="$2"; shift 2 ;;
     --arch)               arch="$2"; shift 2 ;;
     --filter)             filter_override="$2"; shift 2 ;;
-    --sources)            sourcesfile="$2"; shift 2 ;;
+    --hash)               target_hash="$2"; shift 2 ;;
+    --list)               list_only=1; shift ;;
+    --preserve)           preserve="$2"; shift 2 ;;
     --install-dir)        install_dir="$2"; shift 2 ;;
-    --record-cid)         record_cid=1; shift ;;
     --dry-run)            dry_run=1; shift ;;
     -h|--help)            usage; exit 0 ;;
-    *) echo "update-sensor: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "falcon-sensor-fetch: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-die() { echo "update-sensor: $*" >&2; exit 1; }
+die() { echo "falcon-sensor-fetch: $*" >&2; exit 1; }
+
+# Idempotence, checked before anything touches the network. With an explicit
+# --hash the target is known without asking the API, so a host that already has
+# that sensor does no I/O at all -- which is what makes this safe to run on
+# every boot. Without --hash the target depends on the update policy, so the
+# API has to be consulted and the check happens after selection instead.
+if [ -n "$install_dir" ] && [ -n "$target_hash" ]; then
+  case "$target_hash" in
+    sha256-*) want="$(nix hash convert --hash-algo sha256 --to base16 "$target_hash")" ;;
+    *)        want="$target_hash" ;;
+  esac
+  if [ "$(cat "$install_dir/.installed-hash" 2>/dev/null || true)" = "$want" ]; then
+    echo "falcon-sensor-fetch: $want already installed in $install_dir, nothing to do" >&2
+    exit 0
+  fi
+fi
 
 # --- credentials -------------------------------------------------------------
 #
@@ -191,7 +216,7 @@ else
     || die "authentication failed against $host -- check the client id/secret, and whether IP allowlisting in the Falcon console covers this host"
 fi
 
-echo "update-sensor: authenticated against $host (cloud: $cloud)" >&2
+echo "falcon-sensor-fetch: authenticated against $host (cloud: $cloud)" >&2
 
 # Bearer token via a curl config file, so it stays off argv too.
 auth_cfg="$tmp/auth.conf"
@@ -219,8 +244,8 @@ if api_get /sensors/queries/installers/ccid/v1 -o "$ccid_json"; then
   cid="$(jq -r '.resources[0] // empty' < "$ccid_json")"
 fi
 if [ -n "$cid" ]; then
-  echo "update-sensor: customer CID is $cid" >&2
-  echo "update-sensor:   set services.falcon-sensor.cid = \"$cid\"; (or point cidFile at a secret)" >&2
+  echo "falcon-sensor-fetch: customer CID is $cid" >&2
+  echo "falcon-sensor-fetch:   set services.falcon-sensor.cid = \"$cid\"; (or point cidFile at a secret)" >&2
 fi
 
 # --- version selection -------------------------------------------------------
@@ -241,7 +266,7 @@ if [ -n "$update_policy" ]; then
   [ -n "$raw_version" ] || die "no enabled prod sensor update policy named '$update_policy'"
   # The installer FQL rejects decorated versions like "7.20.0 (LTS)".
   sensor_version="$(printf '%s' "$raw_version" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || printf '%s' "$raw_version")"
-  echo "update-sensor: policy '$update_policy' selects sensor version $sensor_version" >&2
+  echo "falcon-sensor-fetch: policy '$update_policy' selects sensor version $sensor_version" >&2
 fi
 
 # --- installer query ---------------------------------------------------------
@@ -256,7 +281,7 @@ else
   if [ -n "$os_version" ]; then     filter="${filter}+os_version:\"${os_version}\""; fi
   if [ -n "$sensor_version" ]; then filter="${filter}+version:\"${sensor_version}\""; fi
 fi
-echo "update-sensor: installer filter: $filter" >&2
+echo "falcon-sensor-fetch: installer filter: $filter" >&2
 
 inst="$tmp/installers.json"
 api_get /sensors/combined/installers/v2 --get \
@@ -265,18 +290,46 @@ api_get /sensors/combined/installers/v2 --get \
   -o "$inst" || die "installer query failed"
 check_errors "$inst" "installer query"
 
-# Drop the SIEM connector (it matches a plain linux filter but is not a sensor),
-# keep .deb only, apply the client-side os regex, then take the highest version.
-sel="$(jq -c --arg re "$os_regex" '
+# The candidate list, least to most recent: drop the SIEM connector (it matches
+# a plain linux filter but is not a sensor), keep .deb only, apply the
+# client-side os regex.
+candidates="$(jq -c --arg re "$os_regex" '
   [ .resources[]?
     | select(((.description // "") | test("Falcon SIEM Connector")) | not)
     | select((.name // "") | endswith(".deb"))
     | select((.os // "") | test($re))
   ]
-  | sort_by((.version // "0") | [splits("[.\\-]")] | map(tonumber? // 0))
-  | last // empty' < "$inst")"
+  | sort_by((.version // "0") | [splits("[.\\-]")] | map(tonumber? // 0))' < "$inst")"
 
-[ -n "$sel" ] || die "no matching .deb installer. Try relaxing --os-regex, or inspect the raw list with --filter and jq."
+if [ "$list_only" -eq 1 ]; then
+  # Newest first, since that is what a human is usually reaching for.
+  jq -r 'reverse[] | "\(.version)\t\(.os) \(.os_version)\t\(.sha256)\t\(.name)"' <<<"$candidates" \
+  | while IFS=$'\t' read -r v osname sha nm; do
+      printf '%s  %-28s %s\n    hash = "%s";\n' \
+        "$v" "$osname" "$nm" "$(nix hash convert --hash-algo sha256 --to sri "$sha")"
+    done
+  exit 0
+fi
+
+if [ -n "$target_hash" ]; then
+  # An SRI hash is what the module option carries; the API indexes installers by
+  # the bare hex of the same sha256, so accept either and normalise to hex.
+  case "$target_hash" in
+    sha256-*) hex="$(nix hash convert --hash-algo sha256 --to base16 "$target_hash")" ;;
+    *)        hex="$target_hash" ;;
+  esac
+  sel="$(jq -c --arg h "$hex" 'map(select(.sha256 == $h)) | last // empty' <<<"$candidates")"
+  if [ -z "$sel" ]; then
+    # Not in the filtered list, but the hash is the API's own id -- so the
+    # download will still work. Trust it rather than refusing.
+    echo "falcon-sensor-fetch: $hex is not in the current installer list; downloading by hash anyway" >&2
+    sel="$(jq -nc --arg h "$hex" '{name:"falcon-sensor.deb", version:"unknown", sha256:$h, os:"", os_version:""}')"
+  fi
+else
+  sel="$(jq -c 'last // empty' <<<"$candidates")"
+fi
+
+[ -n "$sel" ] || die "no matching .deb installer. Try relaxing --os-regex, or inspect the raw list with --list."
 
 name="$(jq -r '.name' <<<"$sel")"
 version="$(jq -r '.version' <<<"$sel")"
@@ -284,10 +337,10 @@ sha256="$(jq -r '.sha256' <<<"$sel")"
 sel_os="$(jq -r '.os // ""' <<<"$sel")"
 sel_osver="$(jq -r '.os_version // ""' <<<"$sel")"
 
-echo "update-sensor: selected $name (version $version, $sel_os $sel_osver)" >&2
+echo "falcon-sensor-fetch: selected $name (version $version, $sel_os $sel_osver)" >&2
 
 if [ "$dry_run" -eq 1 ]; then
-  echo "update-sensor: --dry-run, stopping before download" >&2
+  echo "falcon-sensor-fetch: --dry-run, stopping before download" >&2
   jq -n --arg n "$name" --arg v "$version" --arg s "$sha256" \
         --arg o "$sel_os" --arg ov "$sel_osver" \
         '{name:$n, version:$v, sha256:$s, os:$o, os_version:$ov}'
@@ -303,26 +356,24 @@ api_get "/sensors/entities/download-installer/v2?id=${sha256}" -o "$deb" \
 actual="$(sha256sum "$deb" | cut -d' ' -f1)"
 [ "$actual" = "$sha256" ] \
   || die "checksum mismatch for $name: API declared $sha256, downloaded file is $actual"
-echo "update-sensor: verified sha256 $sha256" >&2
+echo "falcon-sensor-fetch: verified sha256 $sha256" >&2
 
 # --- install mode ------------------------------------------------------------
 #
 # Unpack straight into a host's state directory instead of pinning. Used by
-# falcon-sensor-refresh.service; there is no Nix store involvement, so the
+# falcon-sensor-fetch.service; there is no Nix store involvement, so the
 # binaries never pass through autoPatchelfHook and have to be patched here.
 
 if [ -n "$install_dir" ]; then
-  deb_version="$(printf '%s' "$name" | sed -n 's/^falcon-sensor_\(.*\)_[^_]*\.deb$/\1/p')"
-  [ -n "$deb_version" ] || deb_version="$version"
-  marker="$install_dir/.api-version"
+  marker="$install_dir/.installed-hash"
 
-  if [ "$(cat "$marker" 2>/dev/null || true)" = "$deb_version" ]; then
-    echo "update-sensor: $deb_version already installed in $install_dir, nothing to do" >&2
+  if [ "$(cat "$marker" 2>/dev/null || true)" = "$sha256" ]; then
+    echo "falcon-sensor-fetch: $version ($sha256) already installed in $install_dir" >&2
     exit 0
   fi
 
-  : "${FALCON_INTERPRETER:?set by the update-sensor package}"
-  : "${FALCON_RPATH:?set by the update-sensor package}"
+  : "${FALCON_INTERPRETER:?set by the falcon-sensor-fetch package}"
+  : "${FALCON_RPATH:?set by the falcon-sensor-fetch package}"
 
   staging="$tmp/root"
   mkdir -p "$staging"
@@ -351,12 +402,12 @@ if [ -n "$install_dir" ]; then
     patchelf --set-rpath "$FALCON_RPATH:$install_dir" "$f" 2>/dev/null || true
     patched=$((patched + 1))
   done < <(find "$staging/opt/CrowdStrike" -type f)
-  echo "update-sensor: patched $patched ELF objects for this host" >&2
+  echo "falcon-sensor-fetch: patched $patched ELF objects for this host" >&2
 
   # Preserve the sensor's identity across an in-place upgrade. Same names the
   # module's preserveFiles protects; falconstore carries the AID.
   install -d -m 0755 "$install_dir"
-  for keep in falconstore falconstore.bak falconctl.conf; do
+  for keep in $preserve; do
     if [ -e "$install_dir/$keep" ]; then
       cp -a "$install_dir/$keep" "$staging/opt/CrowdStrike/$keep"
     fi
@@ -365,52 +416,11 @@ if [ -n "$install_dir" ]; then
   # Swap in. Not atomic -- the directory is a bind-mount source, so it cannot be
   # replaced by rename -- but the sensor is stopped by the caller first.
   find "$install_dir" -mindepth 1 -maxdepth 1 \
-    ! -name '.api-version' -exec rm -rf {} +
+    ! -name '.installed-hash' -exec rm -rf {} +
   cp -a "$staging/opt/CrowdStrike/." "$install_dir/"
 
-  printf %s "$deb_version" > "$marker"
-  echo "update-sensor: installed $deb_version into $install_dir" >&2
+  printf %s "$sha256" > "$marker"
+  echo "falcon-sensor-fetch: installed $version ($sha256) into $install_dir" >&2
   exit 0
 fi
 
-# --- pin ---------------------------------------------------------------------
-
-# Flat sha256, which is exactly what requireFile resolves. The store path is
-# reproducible, so any other machine either has it already or runs this once.
-store_path="$(nix-store --add-fixed sha256 "$deb")"
-echo "update-sensor: added to the store as $store_path" >&2
-
-# requireFile takes SRI; the API reports hex.
-sri="$(nix hash convert --hash-algo sha256 --to sri "$sha256")"
-
-# The deb version ("8.10.0-19402") keys the table, because that is what
-# `pkgs.falcon-sensor.override { version = ...; }` selects. The API's own
-# `version` field ("8.10.19402") is kept alongside as the package version.
-entry="$(jq -n \
-  --arg name "$name" --arg version "$version" --arg hash "$sri" \
-  --arg os "$sel_os" --arg os_version "$sel_osver" \
-  --arg arch "$arch" \
-  --arg retrieved "$(date -u +%Y-%m-%d)" \
-  '{name:$name, version:$version, hash:$hash, os:$os,
-    os_version:$os_version, arch:$arch, retrieved:$retrieved}')"
-
-if [ "$record_cid" -eq 1 ] && [ -n "$cid" ]; then
-  entry="$(jq --arg cid "$cid" '. + {cid:$cid}' <<<"$entry")"
-fi
-
-# Merge rather than overwrite: older pins stay selectable via `override`, which
-# matters when a fleet is mid-rollout across two sensor versions.
-deb_version="$(printf '%s' "$name" | sed -n 's/^falcon-sensor_\(.*\)_[^_]*\.deb$/\1/p')"
-[ -n "$deb_version" ] || deb_version="$version"
-
-existing='{}'
-if [ -f "$sourcesfile" ]; then existing="$(cat "$sourcesfile")"; fi
-
-printf '%s\n' "$existing" \
-  | jq --sort-keys --arg k "$deb_version" --argjson v "$entry" '. + {($k): $v}' \
-  > "$sourcesfile.new"
-mv -- "$sourcesfile.new" "$sourcesfile"
-chmod 644 "$sourcesfile"
-
-echo "update-sensor: recorded $deb_version in $sourcesfile" >&2
-echo "update-sensor: commit it -- it holds no secrets, and it is what makes the build reproducible" >&2

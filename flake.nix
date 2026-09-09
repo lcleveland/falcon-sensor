@@ -7,43 +7,44 @@
     { self, nixpkgs }:
     let
       system = "x86_64-linux";
-      pkgs = import nixpkgs {
-        inherit system;
-        config.allowUnfree = true; # the Falcon sensor is proprietary
-      };
+      lib = nixpkgs.lib;
+      pkgs = import nixpkgs { inherit system; };
 
-      # Pins a sensor into pkgs/sources.json, or installs one straight into a
-      # host's state directory with --install-dir. See README "Pinning a sensor"
-      # and "Fetching on the host".
-      update-sensor = pkgs.callPackage ./pkgs/update-sensor.nix { };
+      falcon-sensor-fetch = pkgs.callPackage ./pkgs/falcon-sensor-fetch.nix { };
     in
     {
       packages.${system} = {
-        falcon-sensor = pkgs.callPackage ./pkgs/falcon-sensor.nix { };
-        inherit update-sensor;
-        default = self.packages.${system}.falcon-sensor;
+        inherit falcon-sensor-fetch;
+        default = falcon-sensor-fetch;
       };
 
-      apps.${system}.update-sensor = {
-        type = "app";
-        program = "${update-sensor}/bin/update-sensor";
-        meta.description = "Pin a Falcon sensor installer from the CrowdStrike Sensor Download API";
+      # `nix run .#find-sensor -- --client-id-file … --client-secret-file …`
+      # lists the sensors your tenant can install, each with the SRI hash to
+      # paste into services.falcon-sensor.hash.
+      apps.${system} = {
+        find-sensor = {
+          type = "app";
+          program = toString (
+            pkgs.writeShellScript "find-sensor" ''
+              exec ${lib.getExe falcon-sensor-fetch} --list "$@"
+            ''
+          );
+          meta.description = "List the Falcon sensors this tenant can install, with their hashes";
+        };
+        default = self.apps.${system}.find-sensor;
       };
 
       nixosModules.default = import ./modules/falcon-sensor.nix;
 
-      # Makes `pkgs.falcon-sensor` resolve, which is what the module's `package`
-      # default and a future nixpkgs `mkPackageOption` both look for. Not
-      # required -- the module falls back to callPackage when the overlay is
-      # absent -- but applying it lets you `.override { version = ...; }` the
-      # same way you would upstream.
+      # Makes `pkgs.falcon-sensor-fetch` resolve, which is what the module's
+      # fetcher default looks for. Optional -- the module falls back to
+      # callPackage when the overlay is absent.
       overlays.default = final: _prev: {
-        falcon-sensor = final.callPackage ./pkgs/falcon-sensor.nix { };
-        falcon-update-sensor = final.callPackage ./pkgs/update-sensor.nix { };
+        falcon-sensor-fetch = final.callPackage ./pkgs/falcon-sensor-fetch.nix { };
       };
 
-      # VM test against a synthetic .deb -- the real installer is proprietary
-      # and cannot live in CI. See tests/module.nix.
+      # VM test against a synthetic sensor -- the real installer is proprietary
+      # and the API is unreachable from a test VM. See tests/module.nix.
       checks.${system}.module = import ./tests/module.nix { inherit pkgs self; };
 
       formatter.${system} = pkgs.nixfmt-tree;

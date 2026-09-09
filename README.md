@@ -2,135 +2,87 @@
 
 The CrowdStrike Falcon sensor for Linux, packaged as a NixOS module.
 
-Two things make this awkward on NixOS, and this flake exists to handle both:
+Two things make this awkward on NixOS, and this flake handles both:
 
-- **The installer is behind an authenticated API.** It cannot be `fetchurl`'d.
-  `nix run .#update-sensor` talks to the CrowdStrike Sensor Download API, picks a suitable
-  `.deb`, verifies it, adds it to the Nix store, and records the pin in `pkgs/sources.json`. After that
-  the build is pure, cacheable and offline.
+- **The installer is behind an authenticated API.** It cannot be `fetchurl`'d. Each host
+  downloads it itself, using an API client id and secret you supply as files.
 - **The sensor hard-codes `/opt/CrowdStrike` and writes its identity there.** On a tmpfs root
   that is lost every boot. The module relocates all mutable state to a single `/var/lib`
   directory and bind-mounts it into place, so an impermanent host has exactly one path to
   persist.
 
-> **Unfree and non-redistributable.** Set `nixpkgs.config.allowUnfree = true` (or an
-> `allowUnfreePredicate`) for `falcon-sensor`. Never commit the `.deb`; `.gitignore` blocks it.
+> **Proprietary and non-redistributable.** Nothing about the sensor is committed here; each
+> host fetches its own copy from your tenant.
 
 ## Usage
 
+Create an API client in the Falcon console (**Support and resources → Resources and tools → API
+clients and keys → Create API client**) with the **Sensor Download: read** scope and nothing
+else. Put the id and secret in two files with sops-nix or agenix, then:
+
 ```nix
 {
-  inputs.falcon-sensor.url = "github:you/falcon-sensor";
+  inputs.falcon-sensor.url = "github:lcleveland/falcon-sensor";
 
   # in your host configuration
   imports = [ inputs.falcon-sensor.nixosModules.default ];
 
   services.falcon-sensor = {
     enable = true;
-    cid = "0123456789ABCDEF0123456789ABCDEF-01";
-    provisioningTokenFile = "/run/secrets/falcon-provisioning-token";
-    tags = [ "Environment/Production" "Team/Platform" ];
+
+    api.clientIdFile     = "/run/secrets/falcon-api-client-id";
+    api.clientSecretFile = "/run/secrets/falcon-api-client-secret";
+
+    hash = "sha256-RVNTBhFgWCM2y2bT4POM6btnvXiOFReoL1LvODFvVs8="; # bump to upgrade
+    cid  = "0123456789ABCDEF0123456789ABCDEF-01";
   };
 }
 ```
 
-The module's `package` default builds from `pkgs/sources.json`, so pin a sensor first.
+That is the whole setup: two files, two paths, a hash and a CID.
 
-## Pinning a sensor
+## Choosing the hash
 
-Create an API client in the Falcon console (**Support and resources → Resources and tools → API
-clients and keys → Create API client**). You need the Falcon Administrator role. Give it the
-**Sensor Download: read** scope. Add **Sensor update policies: read** only if you intend to
-use `--update-policy`.
+`hash` is the SHA-256 of the sensor `.deb`. CrowdStrike's download endpoint is keyed by that
+same value (`?id=<sha256>`), so it both selects the installer and verifies it — there is
+nothing else to pin.
+
+List what your tenant can install, each with the line to paste:
 
 ```bash
-nix run .#update-sensor -- \
+nix run github:lcleveland/falcon-sensor#find-sensor -- \
   --client-id-file     /run/secrets/falcon-api-client-id \
   --client-secret-file /run/secrets/falcon-api-client-secret
-
-git add pkgs/sources.json && git commit -m "falcon-sensor: pin 8.x.x"
 ```
 
-The updater discovers your cloud region from the `X-Cs-Region` header, prints your CID, selects
-the newest Debian/Ubuntu `.deb` for the architecture, verifies the download against the SHA-256
-the API declared, runs `nix-store --add-fixed sha256` on it, and records the pin in
-`pkgs/sources.json`. That file holds only properties of the installer itself — name, version,
-hash, target OS and architecture. Nothing in it is secret or specific to your tenant, and it is
-what makes the build reproducible.
-
-Pins accumulate rather than overwrite, keyed by Debian version, so a fleet mid-rollout across
-two sensor versions can select either:
-
-```nix
-services.falcon-sensor.package = pkgs.falcon-sensor.override { version = "8.09.0-19204"; };
+```
+8.10.19402  Ubuntu 16/18/20/22/24        falcon-sensor_8.10.0-19402_amd64.deb
+    hash = "sha256-RVNTBhFgWCM2y2bT4POM6btnvXiOFReoL1LvODFvVs8=";
 ```
 
-With no `version`, the newest pin in the table is used.
+It also prints your CID. Upgrading is bumping `hash` and rebuilding.
 
-Useful flags: `--update-policy platform_default` to take the version from a sensor update
-policy, `--sensor-version` to pin exactly, `--os`/`--os-version`/`--os-regex` to change the
-distro selection, `--filter` to replace the generated FQL outright, `--sources` to write
-somewhere else, and `--dry-run` to see what would be selected. `--help` lists everything.
+**Leaving `hash` unset works but is not recommended.** The host then installs whatever
+`api.updatePolicy` resolves to, or the newest available. That tracks your sensor update policy
+without any action, but two hosts rebuilt on different days can land on different sensors, and
+every boot has to ask the API which one to use. The module warns when it is unset.
 
-Because the pin is a flat SHA-256, the store path is reproducible: another machine either
-already has the blob or runs the updater once. No build ever needs credentials or network.
+With `hash` set, a host that already has that sensor does **no network I/O at all** at boot —
+the check happens before authentication.
 
-If you downloaded the `.deb` from the console by hand instead:
+## What this costs
 
-```bash
-nix-store --add-fixed sha256 falcon-sensor_8.x.x-xxxxx_amd64.deb
-```
+Worth being explicit, because the alternative designs trade differently:
 
-and either add it to `pkgs/sources.json` or pass it inline:
-
-```nix
-services.falcon-sensor.package = pkgs.falcon-sensor.override {
-  name = "falcon-sensor_8.10.0-19402_amd64.deb";
-  hash = "sha256-RVNTBhFgWCM2y2bT4POM6btnvXiOFReoL1LvODFvVs8=";
-};
-```
-
-
-## Fetching on the host
-
-By default the sensor comes from the pinned package and **no API credentials ever reach an
-endpoint**. `apiRefresh` reverses that: each host authenticates to the Sensor Download API
-itself, on a timer, and installs whatever its sensor update policy allows.
-
-```nix
-services.falcon-sensor.apiRefresh = {
-  enable = true;
-  clientIdFile     = "/run/secrets/falcon-api-client-id";
-  clientSecretFile = "/run/secrets/falcon-api-client-secret";
-  updatePolicy     = "platform_default";   # keeps the fleet on N-1/N-2
-  interval         = "daily";
-};
-```
-
-Credentials follow the same convention as everything else — runtime paths, delivered through
-systemd credentials, never in a unit file or the journal. The VM test asserts that.
-
-**Understand the trade-off before enabling this.** It buys sensor upgrades without a rebuild,
-and it is the only way to track a sensor update policy automatically. It costs:
-
-- **API credentials on every endpoint.** A client that can download sensors for the whole
-  tenant now lives on each host. Scope it to *Sensor Download: read* and nothing else.
-- **The installed sensor is no longer described by the system closure.** Two hosts on the same
-  NixOS generation can be running different sensors. `nixos-rebuild` no longer tells you what
-  is deployed; the console does.
-- **Runtime ELF patching.** A sensor fetched at boot never passes through `autoPatchelfHook`,
-  so `update-sensor --install-dir` rewrites each binary's interpreter and RPATH against the
-  same library set the package uses. That set is baked into the updater at build time, so it
-  cannot drift from the packaged sensor — but it is patching done on the host, not in a sandbox.
-
-With `apiRefresh` on, `falcon-sensor-setup` stops populating the state directory — otherwise it
-would overwrite a newer API-fetched sensor with the pinned one on every boot — and `package` is
-used only for its metadata. `falconstore`, `falconstore.bak` and `falconctl.conf` are carried
-across an in-place upgrade, so the host keeps its Agent ID.
-
-The refresh is a no-op when the installed version already matches, and the timer carries a
-one-hour `RandomizedDelaySec` so a fleet does not wake up and hit the API in lockstep.
-
+- **API credentials live on every endpoint.** That is the price of "the user only creates two
+  files". Scope the client to *Sensor Download: read* and nothing else, so a stolen credential
+  can download installers and do nothing more.
+- **The sensor is not in the system closure.** `nixos-rebuild` does not tell you which sensor is
+  deployed — but with `hash` set, your configuration does.
+- **No offline or air-gapped install**, and no sharing the sensor through a binary cache.
+- **The binaries are patched for the host at install time** rather than by `autoPatchelfHook` in
+  a build sandbox. The interpreter and library paths are baked into the fetch tool at build
+  time, so they cannot drift from what the tool was built against.
 ## Secrets
 
 `cidFile`, `provisioningTokenFile` and `maintenanceTokenFile` are **absolute paths to runtime
@@ -159,18 +111,14 @@ services.falcon-sensor.provisioningTokenFile =
   config.age.secrets.falcon-provisioning-token.path;
 ```
 
-The updater's API credentials follow the same convention — `--client-id-file` /
-`--client-secret-file` take a decrypted runtime path (or fall back to `$FALCON_CLIENT_ID` /
-`$FALCON_CLIENT_SECRET`). They are never accepted as positional arguments, since argv is
-readable through `/proc`.
-
-Note that the **API credentials never appear in any NixOS module**. Pinning happens wherever you
-run the updater; managed endpoints hold no Falcon API keys at all.
+`api.clientIdFile` and `api.clientSecretFile` follow the same convention, and are delivered to
+the fetch tool the same way — through systemd credentials, read from `$CREDENTIALS_DIRECTORY`,
+never as arguments, since argv is readable through `/proc`.
 
 The `cid` option is plaintext and lands in the store. That is usually fine — the CID identifies
 your tenant, it does not authenticate — but `cidFile` is there if yours is treated as sensitive.
-`--record-cid` writes the CID into the pin; it is off by default because `pkgs/sources.json` is
-committed.
+`find-sensor` prints your CID alongside the available sensors, so you rarely need to look it up
+in the console.
 
 ### One honest gap
 
@@ -209,25 +157,31 @@ Caveats worth knowing:
   on `statePath`, so the dependency is explicit either way.
 - **Do not clone a host with a populated `/var/lib/falcon-sensor`** — every clone reports as the
   same device. For golden images set `autoRemoveAid = true`, which clears the AID on each start.
-- Nothing under `/opt` needs persisting. It is refreshed from the Nix store on every activation.
+- Nothing under `/opt` needs persisting; it is reconstructed on every boot.
 
 ## How it works
 
-`falcond` hard-codes `/opt/CrowdStrike` for both its binaries and its state, and a store symlink
-there is not good enough: an EDR resolves its own and its peers' identities through
-`/proc/<pid>/exe`, which would read back as a `/nix/store` path.
+`falcond` hard-codes `/opt/CrowdStrike` for both its binaries and its state, and a symlink there
+is not good enough. An EDR resolves its own and its peers' identities through `/proc/<pid>/exe`;
+the `.deb` installs everything read-only (`-r-xr-xr-x`) while the sensor writes into `Packages/`,
+`ASPM/results`, `ASPM/tmp` and `Falcon4IT/results` at runtime. The files have to be real,
+writable files at the hard-coded path.
 
-So `falcon-sensor-setup.service` copies the shipped files out of the store into
-`${statePath}/opt` — guarded by a `.nix-generation` stamp, so only store-provided filenames are
-refreshed on a version bump and the sensor's own state survives — then bind-mounts that onto
+So `falcon-sensor-fetch.service` installs into `${statePath}/opt` and bind-mounts that onto
 `/opt/CrowdStrike`. A bind mount, unlike a symlink, preserves the visible path. The mount is
-guarded by `mountpoint -q`, so repeated `nixos-rebuild switch` runs do not stack mounts.
+guarded by `mountpoint -q`, so repeated `nixos-rebuild switch` runs do not stack mounts, and the
+install is guarded by `.installed-hash`, so a host that already has the pinned sensor does
+nothing at all.
 
-`preserveFiles` (default `[ "falconstore" "falconstore.bak" "falconctl.conf" ]`) names files that are never
-overwritten from the store once they exist. `falconstore` holds the Agent ID, so if a sensor
-release ships that name in its own `.deb`, refreshing it on a version bump would discard the
-host's identity — destroying the very thing persisting `statePath` exists to protect. They are
-still created on first start.
+`preserveFiles` (default `[ "falconstore" "falconstore.bak" "falconctl.conf" ]`) names files
+carried across an upgrade rather than replaced. `falconstore` holds the Agent ID; replacing it on
+a version bump would discard the host's identity and force a re-registration — destroying the
+very thing persisting `statePath` exists to protect.
+
+The sensor ships version-stamped filenames behind unversioned symlinks (`falconctl19402`,
+`falcon-aspm19402`, `KernelModuleArchive19402`). An upgrade replaces the directory wholesale
+rather than merging, so the previous version's files — over 150 MB of them — are not stranded in
+the directory an impermanent host persists.
 
 `falcon-sensor-configure.service` then applies settings with `falconctl -s -f`, and
 `falcon-sensor.service` runs the daemon.
@@ -235,7 +189,6 @@ still created on first start.
 This is also why the module does not use `buildFHSEnv`: in current nixpkgs that is the
 bubblewrap implementation, which puts the daemon in its own mount namespace — the opposite of
 what a kernel-level EDR needs, and it makes `/proc/<pid>/exe` unstable.
-
 ## Reduced Functionality Mode
 
 The sensor validates the running kernel against CrowdStrike's supported-kernel list and falls
@@ -262,9 +215,7 @@ persisted separately — that is normal and nothing the sensor depends on.
 
 ## The systemd unit, and prior art
 
-Sensor **8.10.0-19402 does ship its own unit** at `lib/systemd/system/falcon-sensor.service`,
-so `useVendorUnit = true` works and is the recommended setting — it removes all guesswork. The
-real unit is:
+Sensor 8.10.0-19402 ships its own unit, which this module reproduces rather than guesses at:
 
 ```ini
 [Unit]
@@ -286,86 +237,41 @@ KillSignal=SIGTERM
 Delegate=yes
 ```
 
-The module's own unit (`useVendorUnit = false`, the default) now matches this, with one
-deliberate difference: `restart` defaults to `on-failure` rather than `no`, so a crashed
-security agent comes back. Set `restart = "no"` to match the vendor exactly.
+The module matches this with one deliberate difference: `restart` defaults to `on-failure`
+rather than `no`, so a crashed security agent comes back. Set `restart = "no"` to match exactly.
 
-Worth noting against the community modules, all of which set `WorkingDirectory=/opt/CrowdStrike`:
-**the vendor does not set it**, and `Delegate=yes` — which none of them set — is real and
-matters, since the sensor manages its own cgroup subtree. `PIDFile` is `/var/run/falcond.pid`,
-not `/run/falcond.pid`; the two resolve to the same file through the usual symlink, but the
-`pidFile` option defaults to the vendor's spelling. If the service ever fails with `Can't open
-PID file ... after start`, set `pidFile = null` and let systemd find the main process itself.
+Worth noting against the community NixOS modules, all of which set
+`WorkingDirectory=/opt/CrowdStrike`: **the vendor does not set it**, and `Delegate=yes` — which
+none of them set — is real and matters, since the sensor manages its own cgroup subtree.
+`pidFile` defaults to the vendor's `/var/run/falcond.pid`; set it to `null` if the service ever
+fails with `Can't open PID file ... after start`.
 
-Two mistakes visible in the community modules that this one deliberately avoids:
+Two mistakes visible in the community modules that this one avoids:
 
-- **Symlinking the store into `/opt/CrowdStrike`.** Everything in the `.deb` is installed
-  read-only (`-r-xr-xr-x`), and the sensor writes into `Packages/`, `ASPM/results`, `ASPM/tmp`
-  and `Falcon4IT/results` at runtime. Symlinks into the store make that impossible; this module
-  copies and then applies a recursive `chmod u+w`.
+- **Symlinking the store into `/opt/CrowdStrike`.** Everything in the `.deb` is read-only, and
+  the sensor writes into its own subdirectories at runtime. Symlinks into the store make that
+  impossible.
 - **`rm -rf /opt/CrowdStrike` in `ExecStartPre`.** That wipes the sensor's identity on every
   boot, and is the likely cause of the `Invalid file /opt/CrowdStrike/falconstore length: 0`
-  reports. Here the refresh is stamp-guarded, with `preserveFiles` protecting identity files.
-
-### Upgrades
-
-The sensor ships version-stamped filenames behind unversioned symlinks — `falconctl19402`,
-`falcon-aspm19402`, `KernelModuleArchive19402` and so on. A refresh that only replaced the names
-present in the *new* package would strand the previous version's files forever, and they are
-large: one stale generation is over 150 MB sitting in the directory an impermanent host
-persists. The setup service therefore records a manifest of what it installed and removes
-anything the next version no longer ships.
-
-## Upstreaming to nixpkgs
-
-The layout is deliberately the shape nixpkgs expects, so moving it upstream is a file move
-rather than a rewrite:
-
-| Here | In nixpkgs |
-| --- | --- |
-| `pkgs/falcon-sensor.nix` + `pkgs/sources.json` | `pkgs/by-name/fa/falcon-sensor/{package.nix,sources.json}` |
-| `modules/falcon-sensor.nix` | `nixos/modules/services/security/falcon-sensor.nix` |
-| `tests/module.nix` | `nixos/tests/falcon-sensor.nix`, wired up as `passthru.tests` |
-
-Three decisions follow from that goal:
-
-- **The pin is a package argument, not a module option.** `version` selects from a
-  version-keyed `sources` table feeding `requireFile` — the same shape as nixpkgs'
-  `cisco-packet-tracer_9`, which is behind an identical login wall. Essentially no NixOS module
-  in the tree exposes a source hash as an option, and a module could not read a pin file anyway:
-  upstream it lives in a different tree from the package.
-- **`sources.json` sits beside the package**, not at the repo root, so it travels with
-  `package.nix` into `pkgs/by-name/`. Keeping a JSON pin next to a package is an existing
-  nixpkgs idiom (`1password-gui`, `acli`, `p3x-onenote`, and others).
-- **The module resolves `pkgs.falcon-sensor` first**, falling back to `callPackage` only when
-  the overlay is absent, so the `package` default collapses to a plain `mkPackageOption`
-  upstream with no behaviour change.
-
-`requireFile` packages are established in nixpkgs — around fifty of them — so an installer that
-cannot be fetched during a build is not itself a blocker. What *is* different from most of them
-is that there is no single canonical version: which sensor a tenant may install is set by that
-tenant's sensor update policy, so the shipped pin is a starting point that any user is expected
-to override. That is also why there is no `passthru.updateScript` — refreshing the pin needs
-CrowdStrike API credentials and cannot run unattended.
+  reports. Here the install is hash-guarded, with `preserveFiles` protecting identity files.
 
 ## Packaging notes
 
-The `.deb` is unpacked with `dpkg-deb -x` and patched with `autoPatchelfHook`.
-`autoPatchelfIgnoreMissingDeps` is deliberately **not** set, so a missing library fails the
-build instead of crashing at runtime. If a new sensor version pulls in a library the derivation
-does not provide, the build will say so; find it with:
+The sensor is unpacked with `dpkg-deb -x` and patched for the host: `falcon-sensor-fetch`
+rewrites each ELF object's interpreter and RPATH, because a sensor fetched at runtime never
+passes through `autoPatchelfHook`. The library set — `stdenv.cc.cc.lib`, `openssl`, `libnl`,
+`zlib`, `elfutils`, `libbpf` — is baked into the tool at build time via `runtimeEnv`, so it
+cannot drift from what the tool was built against. It is confirmed sufficient for 8.10.
+
+If a future sensor needs a library that is not there, `falcond` will fail to start with a
+missing-shared-object error. Add it to `pkgs/falcon-sensor-fetch.nix` and check with:
 
 ```bash
 nix develop
-readelf -d result/opt/CrowdStrike/falcond | grep NEEDED
+readelf -d /opt/CrowdStrike/falcond | grep NEEDED
 ```
 
-and add it to `buildInputs` in `pkgs/falcon-sensor.nix`.
-
-The binaries are not stripped (`dontStrip = true`) — the sensor is signed and self-checking. If
-a future version turns out to reject `autoPatchelfHook`'s rewriting, the fallback is to set only
-the interpreter and an explicit `--set-rpath` with `dontPatchELF = true`, the way nixpkgs'
-`intune-portal` does.
+The binaries are never stripped — the sensor is signed and self-checking.
 
 ## Development
 
@@ -375,29 +281,25 @@ nix fmt
 nix develop         # dpkg, patchelf, readelf, curl, jq, shellcheck
 ```
 
-The VM test in `tests/module.nix` builds a synthetic `.deb` with stub binaries, since the real
-installer cannot live in CI. It covers the bind mount, mount idempotency, state survival across
-a package refresh, the `falconctl` argv, and that the provisioning token reaches `falconctl`
-without leaking into units or the journal.
+The VM test in `tests/module.nix` substitutes a stub for `falcon-sensor-fetch` with the same
+interface, since the API is unreachable from a test VM. Two nodes — hash-pinned and
+policy-tracking — cover the bind mount, mount idempotency, that a pinned host does not re-fetch
+a sensor it already has, that bumping the hash upgrades while `preserveFiles` keeps the Agent ID
+and the old version's files are not stranded, the `falconctl` argv, and that no credential
+reaches a unit file or the journal.
 
 ## Status
 
-Verified end-to-end against a real tenant with sensor **8.10.0-19402**: API authentication with
-us-1 → us-2 region autodiscover, CID lookup, installer selection, download, checksum
-verification, store pin, and a clean package build with `autoPatchelfHook` finding every
-library it needed. The module is covered by a 17-subtest NixOS VM test across three nodes —
-pinned, vendor-unit, and `apiRefresh`.
+The API flow was verified end-to-end against a real tenant with sensor **8.10.0-19402**:
+authentication with us-1 → us-2 region autodiscover, CID lookup, installer selection, download,
+and checksum verification. The module is covered by a 9-subtest NixOS VM test.
 
 What that leaves:
 
-- **Not yet run on a real host.** Everything above is build-time and VM-level. Whether
-  `autoPatchelfHook`'s rewriting upsets the sensor's own integrity checking can only be
-  answered by starting `falcond` on real hardware. If it does, the fallback is to set only the
-  interpreter and an explicit `--set-rpath`, with `dontPatchELF = true`.
-- **`apiRefresh`'s HTTP conversation is untested in CI.** The VM test substitutes a stub with
-  the same interface, so credential delivery, ordering, setup deferral and the stop/install/start
-  sequence are all covered — but the API call itself is only proven by the live run above, which
-  exercised the same code path in `--dry-run` and pinning modes rather than `--install-dir`.
+- **Not yet run on a real host.** Everything above is either API-level or VM-level. Whether the
+  runtime ELF patching upsets the sensor's own integrity checking can only be answered by
+  starting `falcond` on real hardware.
+- **The `--install-dir` path is not exercised against the real API.** The live run covered
+  authentication, selection and download; the unpack-and-patch half is covered only by the VM
+  test's stub.
 - **Expect RFM.** See above; nothing about the packaging changes that.
-- `buildInputs` is confirmed sufficient for 8.10. A future sensor may need more; the build will
-  say so rather than failing at runtime.

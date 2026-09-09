@@ -20,7 +20,7 @@
 }:
 
 writeShellApplication {
-  name = "update-sensor";
+  name = "falcon-sensor-fetch";
 
   runtimeInputs = [
     curl
@@ -33,10 +33,11 @@ writeShellApplication {
     patchelf
   ];
 
-  # --install-dir needs to make a vendor binary runnable on a host with no
+  # Installing needs to make a vendor binary runnable on a host with no
   # /lib64/ld-linux and no FHS library paths, so it rewrites the interpreter and
   # RPATH itself. Baked in here rather than discovered at runtime so the closure
-  # is a build-time dependency and cannot drift from the packaged sensor.
+  # is a build-time dependency of this tool rather than something resolved on
+  # the host at install time.
   runtimeEnv = {
     FALCON_INTERPRETER = "${stdenv.cc.bintools.dynamicLinker}";
     FALCON_RPATH = lib.makeLibraryPath [
@@ -49,10 +50,10 @@ writeShellApplication {
     ];
   };
 
-  text = builtins.readFile ../tools/update-sensor.sh;
+  text = builtins.readFile ../tools/falcon-sensor-fetch.sh;
 
   meta = {
-    description = "Pin or install a CrowdStrike Falcon sensor from the Sensor Download API";
-    mainProgram = "update-sensor";
+    description = "Download and install a CrowdStrike Falcon sensor from the Sensor Download API";
+    mainProgram = "falcon-sensor-fetch";
   };
 }
