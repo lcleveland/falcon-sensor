@@ -109,6 +109,66 @@ pkgs.testers.runNixOSTest {
       '';
     };
   };
+
+  # Third node: apiRefresh. The real API cannot be reached from a VM test, so
+  # the updater is swapped for a stub with the same interface. That still
+  # exercises everything the module owns -- credential delivery, ordering, the
+  # setup service standing down, and the stop/install/start dance -- and leaves
+  # only the HTTP conversation untested, which the live run against a real
+  # tenant covered.
+  nodes.apirefresh = {
+    imports = [ self.nixosModules.default ];
+
+    services.falcon-sensor = {
+      enable = true;
+      package = fakePackage;
+      cid = "0123456789ABCDEF0123456789ABCDEF-01";
+      apiRefresh = {
+        enable = true;
+        clientIdFile = "/run/falcon-test-secrets/client-id";
+        clientSecretFile = "/run/falcon-test-secrets/client-secret";
+        package = pkgs.writeShellApplication {
+          name = "update-sensor";
+          runtimeInputs = [ pkgs.coreutils ];
+          text = ''
+            install_dir=""
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --install-dir) install_dir="$2"; shift 2 ;;
+                --client-id-file) id="$(cat "$2")"; shift 2 ;;
+                --client-secret-file) secret="$(cat "$2")"; shift 2 ;;
+                *) shift ;;
+              esac
+            done
+            # Prove the credentials arrived, without putting them on any argv.
+            printf '%s %s\n' "''${id:-none}" "''${secret:-none}" > /run/stub-updater-saw
+            install -d -m 0755 "$install_dir"
+            cp -a ${fakePackage}/opt/CrowdStrike/. "$install_dir"/
+            chmod -R u+w "$install_dir"
+            echo installed-by-api > "$install_dir/.api-installed"
+          '';
+        };
+      };
+    };
+
+    systemd.services.falcon-test-secret = {
+      description = "Provision test API credentials";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "falcon-sensor-refresh.service" ];
+      path = [ pkgs.coreutils ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        install -d -m 0700 /run/falcon-test-secrets
+        hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+        hex 16 > /run/falcon-test-secrets/client-id
+        hex 20 > /run/falcon-test-secrets/client-secret
+        chmod 0400 /run/falcon-test-secrets/*
+      '';
+    };
+  };
   nodes.machine = {
     imports = [ self.nixosModules.default ];
 
@@ -264,5 +324,32 @@ pkgs.testers.runNixOSTest {
         for secret in (cid, maint):
             vendorunit.fail(f"grep -r --binary-files=text -q {secret} /etc/systemd/system/")
             vendorunit.fail(f"journalctl -u falcon-sensor-configure.service | grep -q {secret}")
+
+    with subtest("apiRefresh installs the sensor instead of the pinned package"):
+        apirefresh.wait_for_unit("multi-user.target")
+        apirefresh.wait_for_unit("falcon-sensor-refresh.service")
+        apirefresh.succeed("mountpoint -q /opt/CrowdStrike")
+        # The sensor came from the refresh unit, not from falcon-sensor-setup:
+        # the marker only the stub updater writes must be present.
+        apirefresh.succeed("test -e /opt/CrowdStrike/.api-installed")
+        apirefresh.succeed("test -x /opt/CrowdStrike/falcond")
+        # ... and setup must not have laid down its own manifest.
+        apirefresh.fail("test -e /var/lib/falcon-sensor/opt/.nix-manifest")
+
+    with subtest("API credentials reach the updater and do not leak"):
+        cid_ = apirefresh.succeed("cat /run/falcon-test-secrets/client-id").strip()
+        sec = apirefresh.succeed("cat /run/falcon-test-secrets/client-secret").strip()
+        saw = apirefresh.succeed("cat /run/stub-updater-saw").split()
+        assert saw == [cid_, sec], f"updater saw {saw}, expected the provisioned pair"
+        for secret in (cid_, sec):
+            apirefresh.fail(f"grep -r --binary-files=text -q {secret} /etc/systemd/system/")
+            apirefresh.fail(f"journalctl -u falcon-sensor-refresh.service | grep -q {secret}")
+
+    with subtest("the refresh timer is scheduled"):
+        apirefresh.succeed("systemctl is-active falcon-sensor-refresh.timer")
+        apirefresh.succeed("systemctl show falcon-sensor-refresh.timer -p TimersCalendar | grep -q OnCalendar")
+
+    with subtest("the sensor runs from the API-installed tree"):
+        apirefresh.wait_for_unit("falcon-sensor.service")
   '';
 }

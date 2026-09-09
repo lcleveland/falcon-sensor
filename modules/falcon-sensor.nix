@@ -34,6 +34,23 @@ let
 
   setCredentials = builtins.filter (c: c.path != null) credentials;
 
+  # The API credentials belong to the refresh unit, not the configure unit, but
+  # they follow the same convention and want the same path assertions.
+  apiCredentials = builtins.filter (c: c.path != null) [
+    {
+      name = "client-id";
+      option = "apiRefresh.clientIdFile";
+      path = cfg.apiRefresh.clientIdFile;
+    }
+    {
+      name = "client-secret";
+      option = "apiRefresh.clientSecretFile";
+      path = cfg.apiRefresh.clientSecretFile;
+    }
+  ];
+
+  allCredentials = setCredentials ++ apiCredentials;
+
   # Non-secret falconctl arguments. These come from options that already live in
   # the Nix store, so interpolating them into the script costs nothing. Secret
   # values are appended at runtime from $CREDENTIALS_DIRECTORY instead -- see
@@ -246,6 +263,96 @@ in
         is still created on first start, when it does not yet exist locally.
       '';
     };
+
+    apiRefresh = {
+      enable = lib.mkEnableOption ''
+        fetching the sensor from the CrowdStrike API on the host itself, on a
+        timer, instead of using the pinned {option}`package`.
+
+        This is a real trade-off, not a free upgrade. It keeps hosts on whatever
+        version your sensor update policy allows without a rebuild, but:
+
+        - every host must hold Sensor Download API credentials, which can
+          download installers for the whole tenant;
+        - the installed sensor is no longer described by the system closure, so
+          two hosts on the same NixOS generation can run different sensors;
+        - the binaries are patched for this host at runtime rather than by
+          `autoPatchelfHook` at build time.
+
+        The pinned path is the default for those reasons. With this enabled,
+        falcon-sensor-setup no longer populates the state directory from the Nix
+        store -- falcon-sensor-refresh owns it -- so {option}`package` is used
+        only for its metadata
+      '';
+
+      clientIdFile = lib.mkOption {
+        # NB: string, not path -- see cidFile.
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/secrets/falcon-api-client-id";
+        description = ''
+          Absolute path to a runtime file holding the CrowdStrike API client id.
+          Loaded via systemd credentials.
+        '';
+      };
+
+      clientSecretFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/secrets/falcon-api-client-secret";
+        description = ''
+          Absolute path to a runtime file holding the CrowdStrike API client
+          secret. Needs the "Sensor Download: read" scope, plus "Sensor update
+          policies: read" if {option}`updatePolicy` is set. Loaded via systemd
+          credentials; the value never enters the Nix store, the unit file or
+          the journal.
+        '';
+      };
+
+      cloud = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "us-2";
+        description = ''
+          Falcon cloud region for the API. Left null, the region is discovered
+          from the `X-Cs-Region` header on every run.
+        '';
+      };
+
+      updatePolicy = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "platform_default";
+        description = ''
+          Take the sensor version from this sensor update policy rather than
+          installing the newest available. Requires the "Sensor update
+          policies: read" scope. This is how you keep a fleet on N-1 or N-2.
+        '';
+      };
+
+      sensorVersion = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Pin an exact sensor version instead of tracking a policy.";
+      };
+
+      interval = lib.mkOption {
+        type = lib.types.str;
+        default = "daily";
+        example = "weekly";
+        description = ''
+          `OnCalendar` expression for how often to check the API. The refresh is
+          a no-op when the installed version already matches.
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.falcon-update-sensor or (pkgs.callPackage ../pkgs/update-sensor.nix { });
+        defaultText = lib.literalExpression "pkgs.falcon-update-sensor";
+        description = "The updater used to fetch and install the sensor.";
+      };
+    };
     tags = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -382,11 +489,21 @@ in
         assertion = cfg.proxy.enable -> cfg.proxy.host != "";
         message = "services.falcon-sensor.proxy.host must be set when proxy.enable is true.";
       }
+      {
+        assertion =
+          cfg.apiRefresh.enable
+          -> (cfg.apiRefresh.clientIdFile != null && cfg.apiRefresh.clientSecretFile != null);
+        message = ''
+          services.falcon-sensor.apiRefresh needs both `clientIdFile` and
+          `clientSecretFile` -- the host cannot reach the Sensor Download API
+          without them.
+        '';
+      }
     ]
     ++ map (c: {
       assertion = isAbsolute c.path;
       message = "services.falcon-sensor.${c.option} must be an absolute path to a runtime file, got '${c.path}'.";
-    }) setCredentials
+    }) allCredentials
     ++ map (c: {
       # A Nix path literal would have been copied into the world-readable store
       # by the time we see it here, so reject anything that lives there.
@@ -397,7 +514,7 @@ in
         Pass a runtime path as a string instead, e.g. "/run/secrets/falcon-cid"
         from sops-nix or agenix.
       '';
-    }) setCredentials;
+    }) allCredentials;
 
     warnings =
       lib.optional (cfg.backend == "kernel") ''
@@ -474,71 +591,81 @@ in
         # tooling walks this tree. The secrets never live here -- they arrive
         # through systemd credentials.
         install -d -m 0755 "${cfg.statePath}" "$app"
+        ${lib.optionalString cfg.apiRefresh.enable ''
+          # apiRefresh owns this directory: falcon-sensor-refresh unpacks the
+          # sensor it fetched straight into it, so populating from the store
+          # here would clobber a newer sensor with the pinned one on every boot.
+          echo "falcon-sensor: apiRefresh is enabled, leaving $app to falcon-sensor-refresh"
+        ''}
 
-        # Refresh the shipped files whenever the package changes.
-        #
-        # Names listed in `preserveFiles` are never overwritten once they exist
-        # locally: if a .deb ever ships falconstore or falconctl.conf, a naive
-        # refresh would delete the Agent ID on every sensor upgrade, destroying
-        # exactly what persisting statePath exists to protect. (Sensor 8.10
-        # ships neither, so the default is inert there -- but it costs nothing
-        # and a future release may differ.)
-        #
-        # The manifest exists because the sensor ships version-stamped names --
-        # falconctl19402, KernelModuleArchive19402, falcon-aspm19402 -- behind
-        # unversioned symlinks. Removing only the names present in the *new*
-        # package would strand the previous version's files forever, and they
-        # are large: a single stale generation is over 150 MB sitting in the
-        # directory an impermanent host persists.
-        preserve="${lib.concatStringsSep " " cfg.preserveFiles}"
-        manifest="$app/.nix-manifest"
+        ${lib.optionalString (!cfg.apiRefresh.enable) ''
 
-        if [ "$(cat "$stamp" 2>/dev/null || true)" != "$src" ]; then
-          new_names="$app/.nix-manifest.new"
-          : > "$new_names"
+          # Refresh the shipped files whenever the package changes.
+          #
+          # Names listed in `preserveFiles` are never overwritten once they exist
+          # locally: if a .deb ever ships falconstore or falconctl.conf, a naive
+          # refresh would delete the Agent ID on every sensor upgrade, destroying
+          # exactly what persisting statePath exists to protect. (Sensor 8.10
+          # ships neither, so the default is inert there -- but it costs nothing
+          # and a future release may differ.)
+          #
+          # The manifest exists because the sensor ships version-stamped names --
+          # falconctl19402, KernelModuleArchive19402, falcon-aspm19402 -- behind
+          # unversioned symlinks. Removing only the names present in the *new*
+          # package would strand the previous version's files forever, and they
+          # are large: a single stale generation is over 150 MB sitting in the
+          # directory an impermanent host persists.
+          preserve="${lib.concatStringsSep " " cfg.preserveFiles}"
+          manifest="$app/.nix-manifest"
 
-          for f in "$src"/*; do
-            b="$(basename "$f")"
-            printf '%s\n' "$b" >> "$new_names"
-            case " $preserve " in
-              *" $b "*)
-                if [ -e "$app/$b" ]; then
-                  echo "falcon-sensor: keeping existing state file $b"
-                  continue
+          if [ "$(cat "$stamp" 2>/dev/null || true)" != "$src" ]; then
+            new_names="$app/.nix-manifest.new"
+            : > "$new_names"
+
+            for f in "$src"/*; do
+              b="$(basename "$f")"
+              printf '%s\n' "$b" >> "$new_names"
+              case " $preserve " in
+                *" $b "*)
+                  if [ -e "$app/$b" ]; then
+                    echo "falcon-sensor: keeping existing state file $b"
+                    continue
+                  fi
+                  ;;
+              esac
+              rm -rf "$app/$b"
+              cp -a "$f" "$app/$b"
+            done
+
+            # Drop anything the previous generation installed that this one no
+            # longer ships. Only ever touches names we put there ourselves, so
+            # runtime state the sensor created is never considered.
+            if [ -f "$manifest" ]; then
+              while IFS= read -r old; do
+                [ -n "$old" ] || continue
+                if ! grep -qxF -- "$old" "$new_names"; then
+                  case " $preserve " in
+                    *" $old "*) continue ;;
+                  esac
+                  echo "falcon-sensor: removing stale $old from the previous sensor version"
+                  rm -rf "''${app:?}/$old"
                 fi
-                ;;
-            esac
-            rm -rf "$app/$b"
-            cp -a "$f" "$app/$b"
-          done
+              done < "$manifest"
+            fi
 
-          # Drop anything the previous generation installed that this one no
-          # longer ships. Only ever touches names we put there ourselves, so
-          # runtime state the sensor created is never considered.
-          if [ -f "$manifest" ]; then
-            while IFS= read -r old; do
-              [ -n "$old" ] || continue
-              if ! grep -qxF -- "$old" "$new_names"; then
-                case " $preserve " in
-                  *" $old "*) continue ;;
-                esac
-                echo "falcon-sensor: removing stale $old from the previous sensor version"
-                rm -rf "''${app:?}/$old"
-              fi
-            done < "$manifest"
+            # The .deb ships everything read-only (dr-xr-xr-x / -r-xr-xr-x), and
+            # the store copy is read-only again on top of that. The sensor writes
+            # into its own subdirectories at runtime -- Packages/, ASPM/results,
+            # ASPM/tmp, Falcon4IT/results -- so this has to be recursive; making
+            # only the top level writable leaves those nested directories
+            # unwritable and the sensor unable to work in them.
+            chmod -R u+w "$app"
+
+            mv -- "$new_names" "$manifest"
+            printf %s "$src" > "$stamp"
           fi
+        ''}
 
-          # The .deb ships everything read-only (dr-xr-xr-x / -r-xr-xr-x), and
-          # the store copy is read-only again on top of that. The sensor writes
-          # into its own subdirectories at runtime -- Packages/, ASPM/results,
-          # ASPM/tmp, Falcon4IT/results -- so this has to be recursive; making
-          # only the top level writable leaves those nested directories
-          # unwritable and the sensor unable to work in them.
-          chmod -R u+w "$app"
-
-          mv -- "$new_names" "$manifest"
-          printf %s "$src" > "$stamp"
-        fi
 
         # Bind-mount onto the path the sensor hard-codes. Guarded so that a
         # nixos-rebuild switch which re-runs this unit does not stack mounts.
@@ -549,6 +676,76 @@ in
       '';
     };
 
+    # Fetch the sensor from the CrowdStrike API on this host and unpack it into
+    # the state directory. Only exists when apiRefresh is enabled; otherwise the
+    # sensor comes from the pinned package and no API credentials are present.
+    systemd.services.falcon-sensor-refresh = lib.mkIf cfg.apiRefresh.enable {
+      description = "Fetch the CrowdStrike Falcon sensor from the API";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "falcon-sensor-setup.service"
+        "network-online.target"
+      ];
+      requires = [ "falcon-sensor-setup.service" ];
+      wants = [ "network-online.target" ];
+      before = [
+        "falcon-sensor-configure.service"
+        "falcon-sensor.service"
+      ];
+      unitConfig.RequiresMountsFor = cfg.statePath;
+      path = [ pkgs.systemd ]; # systemctl
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        LoadCredential = map (c: "${c.name}:${c.path}") apiCredentials;
+        # The API is rate-limited and a transient DNS failure at boot should not
+        # leave the host without a sensor forever.
+        Restart = "on-failure";
+        RestartSec = 300;
+      };
+      script = ''
+        set -eu
+
+        # The install swaps the directory contents, so the daemon must not be
+        # running out of it. At boot it never is; on a timer-driven upgrade it
+        # is, and gets started again below.
+        was_active=0
+        if systemctl is-active --quiet falcon-sensor.service; then
+          was_active=1
+          systemctl stop falcon-sensor.service
+        fi
+
+        ${lib.getExe cfg.apiRefresh.package} \
+          --client-id-file "$CREDENTIALS_DIRECTORY/client-id" \
+          --client-secret-file "$CREDENTIALS_DIRECTORY/client-secret" \
+          --install-dir "${cfg.statePath}/opt" \
+          ${lib.optionalString (cfg.apiRefresh.cloud != null) "--cloud ${cfg.apiRefresh.cloud}"} \
+          ${
+            lib.optionalString (
+              cfg.apiRefresh.updatePolicy != null
+            ) "--update-policy ${cfg.apiRefresh.updatePolicy}"
+          } \
+          ${lib.optionalString (
+            cfg.apiRefresh.sensorVersion != null
+          ) "--sensor-version ${cfg.apiRefresh.sensorVersion}"}
+
+        if [ "$was_active" -eq 1 ]; then
+          systemctl start falcon-sensor.service
+        fi
+      '';
+    };
+
+    systemd.timers.falcon-sensor-refresh = lib.mkIf cfg.apiRefresh.enable {
+      description = "Check the CrowdStrike API for a newer Falcon sensor";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.apiRefresh.interval;
+        # Endpoints all waking at once would hammer the API; the check is cheap
+        # but the download is not.
+        RandomizedDelaySec = "1h";
+        Persistent = true;
+      };
+    };
     # Declarative sensor configuration.
     #
     # Secrets are read from root-only systemd credential files at runtime --
@@ -559,8 +756,14 @@ in
     systemd.services.falcon-sensor-configure = {
       description = "Configure the CrowdStrike Falcon sensor";
       wantedBy = [ "multi-user.target" ];
-      after = [ "falcon-sensor-setup.service" ];
-      requires = [ "falcon-sensor-setup.service" ];
+      after = [
+        "falcon-sensor-setup.service"
+      ]
+      ++ lib.optional cfg.apiRefresh.enable "falcon-sensor-refresh.service";
+      requires = [
+        "falcon-sensor-setup.service"
+      ]
+      ++ lib.optional cfg.apiRefresh.enable "falcon-sensor-refresh.service";
       before = [ "falcon-sensor.service" ];
       unitConfig.RequiresMountsFor = cfg.statePath;
       serviceConfig = {

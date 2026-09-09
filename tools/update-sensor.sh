@@ -37,6 +37,9 @@ Selection:
 
 Output:
   --sources PATH        default ./pkgs/sources.json
+  --install-dir DIR     install straight into DIR instead of pinning: unpack,
+                        patch the ELF headers for this host, and keep the
+                        sensor identity files. Used by falcon-sensor-refresh.
   --record-cid          also write the CID into the pin (see README -- sources.json
                         is committed, so this is off by default)
   --dry-run             resolve and print the selection, download nothing
@@ -55,6 +58,7 @@ os_regex='^(Debian|Ubuntu)$'
 arch="x86_64"
 filter_override=""
 sourcesfile="pkgs/sources.json"
+install_dir=""
 record_cid=0
 dry_run=0
 
@@ -71,6 +75,7 @@ while [ $# -gt 0 ]; do
     --arch)               arch="$2"; shift 2 ;;
     --filter)             filter_override="$2"; shift 2 ;;
     --sources)            sourcesfile="$2"; shift 2 ;;
+    --install-dir)        install_dir="$2"; shift 2 ;;
     --record-cid)         record_cid=1; shift ;;
     --dry-run)            dry_run=1; shift ;;
     -h|--help)            usage; exit 0 ;;
@@ -299,6 +304,74 @@ actual="$(sha256sum "$deb" | cut -d' ' -f1)"
 [ "$actual" = "$sha256" ] \
   || die "checksum mismatch for $name: API declared $sha256, downloaded file is $actual"
 echo "update-sensor: verified sha256 $sha256" >&2
+
+# --- install mode ------------------------------------------------------------
+#
+# Unpack straight into a host's state directory instead of pinning. Used by
+# falcon-sensor-refresh.service; there is no Nix store involvement, so the
+# binaries never pass through autoPatchelfHook and have to be patched here.
+
+if [ -n "$install_dir" ]; then
+  deb_version="$(printf '%s' "$name" | sed -n 's/^falcon-sensor_\(.*\)_[^_]*\.deb$/\1/p')"
+  [ -n "$deb_version" ] || deb_version="$version"
+  marker="$install_dir/.api-version"
+
+  if [ "$(cat "$marker" 2>/dev/null || true)" = "$deb_version" ]; then
+    echo "update-sensor: $deb_version already installed in $install_dir, nothing to do" >&2
+    exit 0
+  fi
+
+  : "${FALCON_INTERPRETER:?set by the update-sensor package}"
+  : "${FALCON_RPATH:?set by the update-sensor package}"
+
+  staging="$tmp/root"
+  mkdir -p "$staging"
+  dpkg-deb -x "$deb" "$staging"
+
+  [ -d "$staging/opt/CrowdStrike" ] \
+    || die "the .deb did not contain opt/CrowdStrike -- layout changed?"
+
+  # Everything ships read-only, and the sensor writes into its own
+  # subdirectories at runtime.
+  chmod -R u+w "$staging/opt/CrowdStrike"
+
+  # NixOS has no /lib64/ld-linux-x86-64.so.2 and no FHS library directories, so
+  # every ELF needs its interpreter and RPATH rewritten. Shared objects get an
+  # RPATH but no interpreter; patchelf reports the rest as not-an-ELF and those
+  # are skipped.
+  patched=0
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if ! patchelf --print-rpath "$f" >/dev/null 2>&1; then
+      continue
+    fi
+    if patchelf --print-interpreter "$f" >/dev/null 2>&1; then
+      patchelf --set-interpreter "$FALCON_INTERPRETER" "$f" 2>/dev/null || true
+    fi
+    patchelf --set-rpath "$FALCON_RPATH:$install_dir" "$f" 2>/dev/null || true
+    patched=$((patched + 1))
+  done < <(find "$staging/opt/CrowdStrike" -type f)
+  echo "update-sensor: patched $patched ELF objects for this host" >&2
+
+  # Preserve the sensor's identity across an in-place upgrade. Same names the
+  # module's preserveFiles protects; falconstore carries the AID.
+  install -d -m 0755 "$install_dir"
+  for keep in falconstore falconstore.bak falconctl.conf; do
+    if [ -e "$install_dir/$keep" ]; then
+      cp -a "$install_dir/$keep" "$staging/opt/CrowdStrike/$keep"
+    fi
+  done
+
+  # Swap in. Not atomic -- the directory is a bind-mount source, so it cannot be
+  # replaced by rename -- but the sensor is stopped by the caller first.
+  find "$install_dir" -mindepth 1 -maxdepth 1 \
+    ! -name '.api-version' -exec rm -rf {} +
+  cp -a "$staging/opt/CrowdStrike/." "$install_dir/"
+
+  printf %s "$deb_version" > "$marker"
+  echo "update-sensor: installed $deb_version into $install_dir" >&2
+  exit 0
+fi
 
 # --- pin ---------------------------------------------------------------------
 

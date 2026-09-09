@@ -91,6 +91,46 @@ services.falcon-sensor.package = pkgs.falcon-sensor.override {
 ```
 
 
+## Fetching on the host
+
+By default the sensor comes from the pinned package and **no API credentials ever reach an
+endpoint**. `apiRefresh` reverses that: each host authenticates to the Sensor Download API
+itself, on a timer, and installs whatever its sensor update policy allows.
+
+```nix
+services.falcon-sensor.apiRefresh = {
+  enable = true;
+  clientIdFile     = "/run/secrets/falcon-api-client-id";
+  clientSecretFile = "/run/secrets/falcon-api-client-secret";
+  updatePolicy     = "platform_default";   # keeps the fleet on N-1/N-2
+  interval         = "daily";
+};
+```
+
+Credentials follow the same convention as everything else — runtime paths, delivered through
+systemd credentials, never in a unit file or the journal. The VM test asserts that.
+
+**Understand the trade-off before enabling this.** It buys sensor upgrades without a rebuild,
+and it is the only way to track a sensor update policy automatically. It costs:
+
+- **API credentials on every endpoint.** A client that can download sensors for the whole
+  tenant now lives on each host. Scope it to *Sensor Download: read* and nothing else.
+- **The installed sensor is no longer described by the system closure.** Two hosts on the same
+  NixOS generation can be running different sensors. `nixos-rebuild` no longer tells you what
+  is deployed; the console does.
+- **Runtime ELF patching.** A sensor fetched at boot never passes through `autoPatchelfHook`,
+  so `update-sensor --install-dir` rewrites each binary's interpreter and RPATH against the
+  same library set the package uses. That set is baked into the updater at build time, so it
+  cannot drift from the packaged sensor — but it is patching done on the host, not in a sandbox.
+
+With `apiRefresh` on, `falcon-sensor-setup` stops populating the state directory — otherwise it
+would overwrite a newer API-fetched sensor with the pinned one on every boot — and `package` is
+used only for its metadata. `falconstore`, `falconstore.bak` and `falconctl.conf` are carried
+across an in-place upgrade, so the host keeps its Agent ID.
+
+The refresh is a no-op when the installed version already matches, and the timer carries a
+one-hour `RandomizedDelaySec` so a fleet does not wake up and hit the API in lockstep.
+
 ## Secrets
 
 `cidFile`, `provisioningTokenFile` and `maintenanceTokenFile` are **absolute paths to runtime
@@ -345,8 +385,8 @@ without leaking into units or the journal.
 Verified end-to-end against a real tenant with sensor **8.10.0-19402**: API authentication with
 us-1 → us-2 region autodiscover, CID lookup, installer selection, download, checksum
 verification, store pin, and a clean package build with `autoPatchelfHook` finding every
-library it needed. The module itself is covered by an 11-subtest NixOS VM test across both unit
-strategies.
+library it needed. The module is covered by a 17-subtest NixOS VM test across three nodes —
+pinned, vendor-unit, and `apiRefresh`.
 
 What that leaves:
 
@@ -354,6 +394,10 @@ What that leaves:
   `autoPatchelfHook`'s rewriting upsets the sensor's own integrity checking can only be
   answered by starting `falcond` on real hardware. If it does, the fallback is to set only the
   interpreter and an explicit `--set-rpath`, with `dontPatchELF = true`.
+- **`apiRefresh`'s HTTP conversation is untested in CI.** The VM test substitutes a stub with
+  the same interface, so credential delivery, ordering, setup deferral and the stop/install/start
+  sequence are all covered — but the API call itself is only proven by the live run above, which
+  exercised the same code path in `--dry-run` and pinning modes rather than `--install-dir`.
 - **Expect RFM.** See above; nothing about the packaging changes that.
 - `buildInputs` is confirmed sufficient for 8.10. A future sensor may need more; the build will
   say so rather than failing at runtime.

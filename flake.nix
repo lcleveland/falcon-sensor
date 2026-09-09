@@ -12,20 +12,10 @@
         config.allowUnfree = true; # the Falcon sensor is proprietary
       };
 
-      # Pins a sensor from the CrowdStrike Sensor Download API and writes
-      # sensor.lock.json. See README "Pinning a sensor".
-      update-sensor = pkgs.writeShellApplication {
-        name = "update-sensor";
-        runtimeInputs = with pkgs; [
-          curl
-          jq
-          coreutils
-          gnused
-          gnugrep
-          nix
-        ];
-        text = builtins.readFile ./tools/update-sensor.sh;
-      };
+      # Pins a sensor into pkgs/sources.json, or installs one straight into a
+      # host's state directory with --install-dir. See README "Pinning a sensor"
+      # and "Fetching on the host".
+      update-sensor = pkgs.callPackage ./pkgs/update-sensor.nix { };
     in
     {
       packages.${system} = {
@@ -49,6 +39,7 @@
       # same way you would upstream.
       overlays.default = final: _prev: {
         falcon-sensor = final.callPackage ./pkgs/falcon-sensor.nix { };
+        falcon-update-sensor = final.callPackage ./pkgs/update-sensor.nix { };
       };
 
       # VM test against a synthetic .deb -- the real installer is proprietary
