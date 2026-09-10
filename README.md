@@ -60,7 +60,8 @@ nix run github:lcleveland/falcon-sensor#find-sensor -- \
     hash = "sha256-RVNTBhFgWCM2y2bT4POM6btnvXiOFReoL1LvODFvVs8=";
 ```
 
-It also prints your CID. Upgrading is bumping `hash` and rebuilding.
+It also prints your CID — see [Finding your CID](#finding-your-cid). Upgrading is bumping
+`hash` and rebuilding.
 
 **Leaving `hash` unset works but is not recommended.** The host then installs whatever
 `api.updatePolicy` resolves to, or the newest available. That tracks your sensor update policy
@@ -69,6 +70,59 @@ every boot has to ask the API which one to use. The module warns when it is unse
 
 With `hash` set, a host that already has that sensor does **no network I/O at all** at boot —
 the check happens before authentication.
+
+## Finding your CID
+
+The CID identifies your tenant, and the sensor cannot register without it — the module asserts
+that either `cid` or `cidFile` is set. It looks like `0123456789ABCDEF0123456789ABCDEF-01`:
+32 hex characters, then a two-character checksum. Use the whole thing, checksum included; case
+does not matter.
+
+Three places to get it.
+
+**From the API, with the credentials you already created.** `find-sensor` prints the CID above
+the sensor list, so the one command that gives you a `hash` line also gives you a `cid` line —
+and the *Sensor Download: read* scope from [Usage](#usage) is all it needs:
+
+```bash
+nix run github:lcleveland/falcon-sensor#find-sensor -- \
+  --client-id-file     /run/secrets/falcon-api-client-id \
+  --client-secret-file /run/secrets/falcon-api-client-secret
+```
+
+```
+falcon-sensor-fetch: authenticated against api.<your-cloud>.crowdstrike.com (cloud: <your-cloud>)
+falcon-sensor-fetch: customer CID is 0123456789ABCDEF0123456789ABCDEF-01
+falcon-sensor-fetch:   set services.falcon-sensor.cid = "0123456789ABCDEF0123456789ABCDEF-01";
+```
+
+Those lines go to stderr and the sensor list to stdout, so a redirect keeps them apart. If the
+sensors are listed but the CID line is missing, only the CID lookup failed — the run continues
+without it, since listing sensors does not need one.
+
+**From the Falcon console.** **Host setup and management → Deploy → Sensor downloads**: the CID
+is shown at the top of the page, above the installer list, with a copy button. Menu labels move
+between console versions; it is on whichever page offers the sensor installers, presented as
+"Customer ID (CID)".
+
+**From a host already running the sensor** — the way to confirm what a deployed host actually
+registered with, rather than what you meant to give it:
+
+```bash
+sudo /opt/CrowdStrike/falconctl -g --cid
+```
+
+That answers `cid="..."`, or `cid is not set.` on a host that has never been configured. It
+reports the 32 hex characters without the checksum suffix, so compare the leading part rather
+than the whole string. `falconctl` is mode 0500, hence the `sudo`; for a check from a desktop
+session, turn on the status file with identifiers and read that instead:
+
+```bash
+jq -r .identifiers.cid /run/falcon-sensor/status.json   # needs status.includeIdentifiers
+```
+
+That publishes the CID to every local user, which is why it is off by default — see
+[Seeing the state](#seeing-the-state-the-status-file-and-the-tray-icon).
 
 ## What this costs
 
@@ -118,7 +172,7 @@ never as arguments, since argv is readable through `/proc`.
 The `cid` option is plaintext and lands in the store. That is usually fine — the CID identifies
 your tenant, it does not authenticate — but `cidFile` is there if yours is treated as sensitive.
 `find-sensor` prints your CID alongside the available sensors, so you rarely need to look it up
-in the console.
+in the console — see [Finding your CID](#finding-your-cid).
 
 ### One honest gap
 
@@ -192,8 +246,8 @@ what a kernel-level EDR needs, and it makes `/proc/<pid>/exe` unstable.
 ## Reduced Functionality Mode
 
 The sensor validates the running kernel against CrowdStrike's supported-kernel list and falls
-back to **RFM** when it is not on that list — which is usually the case for NixOS kernels. In
-RFM the sensor still reports heartbeats and asset inventory, but performs no detection or
+back to **RFM** when it is not on that list, which a NixOS kernel may well not be. In RFM
+the sensor still reports heartbeats and asset inventory, but performs no detection or
 prevention.
 
 ```bash
@@ -206,7 +260,9 @@ falcon-kernel-check
 
 `backend = "bpf"` is the default because the eBPF backend runs in user space and has far looser
 kernel requirements than the `kernel` backend, which wants a module built against a supported
-kernel. No packaging choice avoids RFM entirely; that is a decision on CrowdStrike's side.
+kernel, and it is what the one host running this so far is out of RFM with. That is not a
+promise for your kernel: the supported list is CrowdStrike's, no packaging choice overrides
+it, and `falcon-kernel-check` above answers it for the kernel you are on.
 
 `falconctl` writes to `/var/log/falconctl.log`, so check there as well as the journal when the
 sensor misbehaves. On an impermanent host that log is lost at reboot unless `/var/log` is
@@ -360,19 +416,39 @@ and a StatusNotifierItem host.
 
 ## Status
 
-The API flow was verified end-to-end against a real tenant with sensor **8.10.0-19402**:
-authentication with us-1 → us-2 region autodiscover, CID lookup, installer selection, download,
-and checksum verification. The module is covered by a 12-subtest NixOS VM test.
+**Running on a real host.** This machine has been on the module since 2026-09-09 with sensor
+**8.10.19402.0** (the `8.10.0-19402` installer): `falcond` starts, registers with the tenant,
+reaches CrowdStrike's cloud, keeps its AID across a reboot, and is **out of RFM** on the kernel
+it is running.
+
+That answers the two questions this section used to be entirely about:
+
+- **The runtime ELF patching does not upset the sensor's integrity checking.** A sensor whose
+  interpreter and RPATHs were rewritten after download runs and reports itself healthy.
+- **The unpack-and-patch half is exercised for real**, not only against the VM test's stub:
+  `falcon-sensor-fetch.service` installed into `${statePath}/opt`, bind-mounted it onto
+  `/opt/CrowdStrike`, and on the next boot logged `already installed ... nothing to do` — the
+  hash-guarded, no-network path, on real hardware.
+
+The API flow was verified end-to-end against a real tenant: authentication with region
+autodiscover, CID lookup, installer selection, download, and checksum verification. The module
+is covered by a 12-subtest NixOS VM test.
 
 What that leaves:
 
-- **Not yet run on a real host.** Everything above is either API-level or VM-level. Whether the
-  runtime ELF patching upsets the sensor's own integrity checking can only be answered by
-  starting `falcond` on real hardware.
-- **The `--install-dir` path is not exercised against the real API.** The live run covered
-  authentication, selection and download; the unpack-and-patch half is covered only by the VM
-  test's stub.
-- **Expect RFM.** See above; nothing about the packaging changes that.
-- **The tray icon has not been watched in a real tray.** Its state machine is covered by the
-  VM test, and the status file it renders is real, but whether a given tray host resolves the
-  bundled icon names through `IconThemePath` is host-specific and only a session can answer.
+- **One host, one tenant, one sensor version.** Nothing here says how the module behaves on a
+  second host or a different tenant, and no version bump has been done on real hardware — that
+  `preserveFiles` keeps the AID through an upgrade is still only the VM test's word.
+- **RFM is not a given, in either direction.** This host is out of RFM, so the eBPF backend does
+  reach full functionality on at least one NixOS kernel — but the kernel has to be on
+  CrowdStrike's list, and a `nixos-unstable` bump can take it back off without warning. Check
+  rather than assume; that is what the status file is for.
+- **`backend` publishes as `null` on a real sensor.** The real `falconctl -g --backend` answers
+  without a `backend=` line, so the status file's `backend` field stays null even on a host
+  visibly running `falcon-sensor-bpf`. Cosmetic — nothing reads the field to make a decision —
+  but the example above is what the VM stub produces, not what this host does.
+- **The tray survives a session but is not polished.** It runs here across reboots; it also logs
+  a `GTK_IS_WIDGET` assertion from the AppIndicator binding at startup, and exits non-zero when
+  the display goes away at session end (`PartOf=graphical-session.target` stops it either way).
+  Whether a given tray host resolves the bundled icon names through `IconThemePath` is still
+  host-specific.

@@ -182,7 +182,7 @@ authenticate() { # <host> -> sets $token and $region
   region="$(sed -n 's/^[Xx]-[Cc][Ss]-[Rr]egion:[[:space:]]*//p' "$hdrs" | tr -d '\r' | head -n1)"
   [ "$rc" -eq 0 ] || return "$rc"
 
-  # Verified against a real us-2 tenant: probing the wrong region answers
+  # Verified against a real tenant: probing the wrong region answers
   # "HTTP/1.1 308 Permanent Redirect" with X-Cs-Region naming the right cloud
   # and an empty body -- not the 403 the vendor SDK's autodiscover implies.
   # curl treats 3xx as success, so a missing token here is normal and must not
